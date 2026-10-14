@@ -2688,6 +2688,12 @@ if !prof.calibrated {
     }
 
     fn restore_channel_auto(&mut self, i: usize, cfg: &mut AppConfig) {
+        // Bounded here as well as at the call site: this writes the config, and
+        // a channel index from elsewhere (a future hotkey, a saved selection)
+        // must not index past the config's end.
+        if i >= cfg.channels.len() || i >= self.nct.fan_count() {
+            return;
+        }
         let ok = self.nct.restore_auto(i);
         cfg.channels[i].mode = FanMode::Auto;
         let name = channel_display_name(&cfg.channels[i]);
