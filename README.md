@@ -50,15 +50,25 @@ writes above the count are refused, and the UI shows only real channels.
 
 ## Building
 
-Requires the **GNU** Rust toolchain on Windows (`windres` from mingw64, `ar`
-from binutils) — `build.rs` embeds a `requireAdministrator` manifest, and fails
-loudly if `ar` is missing rather than shipping an exe that silently cannot
-reach the driver.
+Requires the **GNU** Rust toolchain (`windres` + `ar` from mingw64) — not the
+MSVC one a default Windows `rustup` installs. `build.rs` embeds a
+`requireAdministrator` manifest through `windres`, and fails loudly if `ar` is
+missing rather than shipping an exe that silently cannot reach the driver.
 
-Requires the **GNU** toolchain (`windres` + `ar` from mingw64). Check with
-`rustup toolchain list` — if only `stable-x86_64-pc-windows-msvc` is installed,
-add `rustup toolchain install stable-x86_64-pc-windows-gnu` and a mingw64 whose
-`bin` is on `PATH`.
+Check first:
+
+```sh
+powershell -ExecutionPolicy Bypass -File tools/check-build-env.ps1
+```
+
+It reports the toolchain, whether `windres`/`ar` are on `PATH`, and whether the
+runtime assets are present, and prints the fix for anything missing. To set it
+up by hand:
+
+```sh
+rustup toolchain install stable-x86_64-pc-windows-gnu
+rustup default stable-x86_64-pc-windows-gnu   # plus mingw64 bin on PATH
+```
 
 ```sh
 # one-time: fetch the third-party runtime assets (see "Runtime assets" below)

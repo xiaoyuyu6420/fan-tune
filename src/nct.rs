@@ -869,6 +869,38 @@ mod tests {
         }
     }
 
+    /// Someone else's machine: the chip is not in the table at all. `detect`
+    /// must return None (so it reports "no supported chip" and exits) rather
+    /// than falling back to some default register map — writing a real chip's
+    /// registers to unknown hardware is the one failure this must never have.
+    #[test]
+    fn unknown_chips_are_not_guessed() {
+        // ids we have never heard of, and a known id with an unknown revision
+        for (id, rev) in [(0x00u8, 0x00u8), (0xFF, 0xFF), (0xA0, 0x11), (0xD4, 0x99)] {
+            assert!(
+                lookup_chip(id, rev).is_none(),
+                "id 0x{id:02X} rev 0x{rev:02X} must not resolve to a register map"
+            );
+        }
+    }
+
+    /// The chips we recognise but refuse to drive must say why, in the user's
+    /// language, because `detect` surfaces `note` verbatim in a dialog.
+    #[test]
+    fn refused_chips_explain_themselves() {
+        for (id, rev, why) in [
+            (0xD4u8, 0x40u8, "ambiguous / same id-rev as another chip"),
+            (0xD5, 0x92, "NCT668x EC-space access"),
+            (0xD8, 0x02, "ambiguous / same id-rev as another chip"),
+            (0xC7, 0x32, "NCT6683D EC-space access"),
+            (0xB4, 0x70, "read-only, no writable fan registers"),
+        ] {
+            let s = lookup_chip(id, rev).unwrap_or_else(|| panic!("{id:02X}/{rev:02X} unresolved"));
+            assert!(!s.usable, "{why} should be refused");
+            assert!(!s.note.is_empty(), "{why} must explain itself to the user");
+            assert_eq!(s.fans, 0, "{why} must expose no fans to drive");
+        }
+    }
     /// Id/revision matching, including the masked revisions (NCT6779D answers
     /// with a whole 0x6x range) and the two chips we deliberately refuse.
     #[test]
