@@ -1,0 +1,25 @@
+# build output
+/target/
+**/*.rs.bk
+
+# runtime sidecars written next to the exe
+fantune.json.bak
+fantune.json.corrupt
+fantune.json.new
+fantune-originals.json
+fantune-rgb.json
+fan-tune.log
+fan-tune.log.old
+fan-tune-gui.log
+fan-tune-*.req
+fan-tune-hardware.lock
+
+# kernel driver blobs + PawnIO modules are deployment artifacts,
+# not source (see driver/README for where they come from)
+driver/*.sys
+driver/*.bin
+
+# local scaffolding
+.zcode/
+_ui_shot*.png
+*_out*.txt

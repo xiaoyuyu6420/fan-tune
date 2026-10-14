@@ -1,0 +1,21 @@
+PawnIO module binaries in this folder
+=====================================
+  LpcIO.bin    (raw I/O port access + SuperIO helpers)  sha256 3dcf8b2bc80ff642d97c4608511a818642b5bf315ff53df3df393d043e71d101
+  IntelMSR.bin (MSR reads)                              sha256 f3ab69f0a2686813de2f47efcda6271e176c4ee50fab5f107254f7d6a4e77361
+
+These are compiled PawnIO modules, taken from the official PawnIO.Modules
+release (https://github.com/namazso/PawnIO.Modules) as vendored by
+LibreHardwareMonitor 0.9.5 (LibreHardwareMonitorLib/Resources/PawnIo/).
+
+License: LGPL-2.1
+  https://www.gnu.org/licenses/old-licenses/lgpl-2.1.html
+  https://github.com/namazso/PawnIO.Modules/blob/master/LICENSE
+Corresponding source: https://github.com/namazso/PawnIO.Modules
+
+The PawnIO kernel driver itself is NOT redistributed with fan-tune. Install it
+from https://pawnio.eu (LibreHardwareMonitor and FanControl install it the same
+way). fan-tune only loads these modules into the already-installed driver.
+
+Why they are here: with WinRing0 being flagged by Defender and blocked when
+HVCI / Smart App Control enforce the vulnerable-driver list, PawnIO is the
+signed path that keeps working. Both files must sit next to fan-tune.exe.
