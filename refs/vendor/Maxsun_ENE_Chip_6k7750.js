@@ -8,7 +8,7 @@ export function Type() { return "rawusb"; }
 
 import systeminfo from "@SignalRGB/systeminfo";
 
-//插件作者:Sky QQ: 3814725166
+//插件作者:Sky (联系方式见出处仓库)
 //gitlab: https://gitlab.com/nollie/chinese-motherboard-signalrgb-plugin
 //因为不是所有铭瑄主板都有单独适配，如果使用Default Maxsun device出现问题，作者不承担责任
 export function ControllableParameters() {

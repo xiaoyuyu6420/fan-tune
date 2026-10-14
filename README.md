@@ -1,168 +1,129 @@
-# fan-tune 使用说明
+# fan-tune
 
-## 功能总览
-- **传感器**：CPU 温度/负载、7 通道风扇转速+占空比、主板电压、NVMe 硬盘温度、显卡（温度/占用/显存/功耗/风扇）、内存占用率
-- **风扇控制**：手动 / 温度曲线（可视化拖拽编辑）/ 自动（恢复 BIOS），带 toast 反馈
-- **小工具**：一键全速散热、一键静音（可随时取消）、高温警告横幅、系统托盘常驻
-- **守护模式**：`fan-tune.exe daemon` 后台自动按曲线控制，崩溃自动重启、温度源失效自动进入 70% 安全占空、配置热重载、事件日志 `fan-tune.log`
+Windows fan controller for Nuvoton NCT6779D..NCT6799D SuperIO/EC chips, with a
+temperature-curve engine, a closed-loop "budget" thermostat, and an ENE 6k7750
+ARGB light controller.
 
-## 单一控制者（重要架构）
-- **GUI 打开时**：自动停止后台控制者，自己就是唯一的硬件控制者（内置控制循环+安全模式）
-- **GUI 退出时**：自动保存配置，**派生一个新的隐藏窗口实例**（`fan-tune.exe tray`）接手——注意：实际派生的是 tray 实例，不是 `daemon` 子命令；`daemon` 目前只有手动运行才会启动。两条路径共用同一份曲线引擎和安全常量，但 GUI 这条还多做了"数据陈旧判定"，所以维护/新增安全逻辑时两个文件都要看（这是待收口的重复实现）
-- 任何时刻只有一个进程写风扇寄存器——**真正的保证是驱动设备只允许一个进程打开**（`FILE_SHARE_NONE`），"哨兵交接 + 8 秒重叠"只是让这个等待尽量干净。所以日志里出现"driver open failed (round 1..N)"是交接期间的正常重试，不是故障
-- GUI 有单实例保护：重复双击会弹提示而不是打架
-- 全速/静音是"覆盖层"：一键生效，再点一次取消——**取消时会把接管的通道还回原设定**（曲线/手动按配置重写；处于"自动"的通道直接交还 BIOS 控制），不污染已保存的曲线
-- **覆盖层碰不到的通道**：`enabled: false`（完全不写，例：水泵）或 `protected: true`（照常跟自己的曲线，但一键全速/静音和"温度源失效兜底"都不动它）。未启用的通道在面板上会显示「未启用·不写入」标记
+Built for one specific machine (MSI/MAXSUN board, NCT6796D-R) and made public
+because two parts of it are reusable: the curve engine and the light controller.
 
-## 开机自启
-- 计划任务 `FanTune`（登录触发、最高权限、崩溃自动重启×3）：登录后自动以 **tray 模式**启动 GUI——无窗口、不弹 UAC、托盘图标常驻、立即接管风扇控制
-- 双击 `fan-tune.exe` 打开的是同一个实例（单实例保护，直接唤出面板）
-- 退出 GUI（关窗/托盘退出）→ 自动保存配置 → 拉起 daemon 接班；daemon 崩了任务也会重启它
-- 重装自启任务：管理员运行 `fan-tune.exe install`
-- **驱动交接**：GUI 接管时优先"优雅停止"——放哨兵文件让 daemon 自己干净退出（句柄正常关闭，驱动不受伤）；超时才强杀兜底
-- **驱动自愈**：启动时若设备打不开会**耐心重试**（每 30 秒一轮，坚持约 8 分钟）——强杀进程或快速启动恢复后，内核驱动会短暂"卡住"几分钟后自愈，重试正好覆盖这个窗口，无需重启
-- **⚠️ 快速启动的坑**：本机快速启动（HiberbootEnabled=1）开着，"关机"会把内核状态原样存盘恢复——包括卡住的驱动状态。建议关闭（管理员执行 `reg add "HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Power" /v HiberbootEnabled /t REG_DWORD /d 0 /f`），"重启"才是真正的彻底重启
-- **驱动卡死怎么办**：先等几分钟（自愈），仍不行才重启电脑
+> **This writes to hardware fan control registers through a ring-0 driver.** It
+> is not a general-purpose tool. Read [Which machines it drives](#which-machines-it-drives)
+> before running it.
 
-## 控制模式（顶栏 或 托盘右键 切换）
-- **标准**：每条通道各按自己的设置运行（曲线 / 手动 / 自动）
-- **游戏**：按"温度 +5°C"提前拉曲线——**低温一样安静**（曲线的低谷段完全不变），热起来比标准更早、更猛地压；参数 `gaming_temp_offset`（fantune.json 可调，0-20）
-- **服务器**：长期稳定优先——**照常跟随温度**（冷却不缩水），但变化极慢：限速 3%/s + 迟滞 3°C + EMA 平滑（用户自己设的更保守值优先），绝不来回抖；通道自身温度源 ≥85°C 时强制 100%，回落到 80°C 才解除（`server_guard_c` 可调）
-- 模式写入 fantune.json 的 `profile` 字段，GUI 与 daemon 都遵守（切换即时生效、重启保持）
-- 游戏/服务器的响应参数在**引擎内部**生效（迟滞/限速之前），引擎状态与风扇实际转速始终一致
-- 新增温度源 **`gpu:0`**（显卡温度）——打游戏时冷排可以直接跟显卡温度走
-- 曲线编辑区顶部有**通道选择器**（机箱扇/280冷排/水泵/…），点一下切换要编辑的通道
-
-## 安全兜底
-- **温度源失效**：连续 5 次温度源读不到（含"读到的数据超过 6 秒没更新"——传感器线程卡住/挂掉的情况），曲线通道会被顶到 70% 占空吹着，直到源恢复；`enabled:false` / `protected` 通道不参与
-- GUI 与 daemon 用同一套判定和同一份常量（以前是两份实现，GUI 在"读不到温度"时直接放行，等于没有兜底）
-- 退出/被接管时不会把芯片留在软件控速模式：处于"自动"的通道会被交还 BIOS（覆盖层取消时同样如此）
-
-## 性能（实测口径）
-- **后台/非前台状态 1.0% 单核**（user 0.31% + kernel 0.70%），此前是 **22.8~25.3%**——相差 **21 倍**（16 核机器上约 0.06% 的总 CPU）
-- **被看着的时候**动画照常跑（这是设计：进度条/温度游标平滑过渡），此时 egui 会在动画进行中按显示刷新率重绘——代价只在"有人真的在看"时产生，托盘常驻/日志场景完全不受影响
-- **根因**：`ctx.animate_value_with_time()` 被挂在**每秒都在变的值**上（占空比进度条、曲线上的当前温度游标、卡片高亮）。egui 的动画只要目标还在变就永远处于"动画中"，而动画中的每一帧都会请求一次重绘 → 程序被钉在显示器刷新率上满速重绘（实测 85~146 帧/秒）。现在动画只在"可见且在前台"（有人真在看）时才跑，其余情况下直接取目标值、不启动动画，重绘回到 1 帧/秒
-- **判断方法**（值得记住）：`\Thread(进程名/0)\Context Switches/sec` 看是不是几百次/秒；帧数用一行临时日志数一下（425~729 帧/5秒 = 满速，6 帧/5秒 = 正常）
-- **外部工具调用全部带超时**（smartctl 8s / nvidia-smi 5s）：卡住的工具不会再把传感器线程冻死，超时即计入兜底
-- **实测启动频率**（40 秒窗口数进程）：nvidia-smi 1.5 次/秒 → **0.05 次/秒**；smartctl 0.87 次/秒 → **0.17 次/秒**（轮询 10 秒 + 跳过 scoop shim）
-- **端口操作减少约 2/3**：EC 是分 bank 的，原来每读一个寄存器都要"选 bank + 选寄存器 + 读"4 次端口操作；现在按 bank 分组 + 记住当前 bank（每寄存器 2 次），温度源路由寄存器（开机后不变）只读一次，电压只在慢档刷新。daemon 更是只读温度（`read_temps`），不碰占空比/转速/电压
-  - 注意：**这几项省的是硬件访问量，不是 CPU**——实测工作线程本来就只占 0.0%（性能计数器按线程读），CPU 全在事件循环那个 bug 上
-- **后端选择对 CPU 几乎没影响**（实测同状态 WinRing0 25.3% vs PawnIO 22.8%，都在噪声内）——所以后端按"能不能用/稳不稳"选，不是按性能选
-
-## 系统托盘
-- 右下角托盘图标：左键点击显示/隐藏面板
-- 右键菜单：显示面板 / 全速散热 / 静音模式 / 退出（后台守护自动接管）
-- 关闭窗口或托盘退出都会自动交还 daemon，风扇控制不断档
-- 面板隐藏到托盘时自动降为 1fps 重绘（可见时 30fps），不白烧 CPU
-
-## 硬件说明
-- 内存温度：DDR4 内存条无温度传感器，物理不可读（本机为 DDR4）
-- 本机存储栈拦截 NVMe 协议直查（ERROR_INVALID_FUNCTION），硬盘温度走 smartctl（已装）
-
-## RGB 灯控（主板 ARGB，实验阶段）
-
-主板灯控芯片是 **ENE 6k7750**，以复合 USB 设备 `VID_0CF2 / PID_7750` 挂在总线上：
-
-- `MI_00`（设备名 "MS-ARGB"）由微软通用 WinUSB 驱动接管（固件用 MS OS 描述符声明，所以没有厂商 INF）。**打开句柄必须带 `FILE_FLAG_OVERLAPPED`**，否则 `WinUsb_Initialize` 直接返回错误 6（ERROR_INVALID_HANDLE）——这个坑花了一轮排查。
-- `MI_01` 是厂商自定义 HID（`usage_page 0xFF72 / usage 0xA1`），社区 SignalRGB 插件认的就是它。
-- 协议 = **裸 USB 控制传输**，按寄存器寻址：读 `bmRequestType 0xC0 / bRequest 0x81`，写 `0x40 / 0x80`，`wIndex` 放寄存器、`wValue` 恒为 0。ARGB 通道 1 的数据在 `0xE300`、通道 2 在 `0xE480`（各 128 灯珠上限、每灯 3 字节 R,G,B，按串联顺序），12V RGB 在 `0xE600 / 0xE603`。每个输出后面跟 `mode=0x01 / speed / direction / brightness / commit=0x01`，整帧再向 `0xE021 / 0xE02F / 0xE031 / 0xE03F` 写 `0x01`。
-- **LED 缓冲区可读**（`0xE300` 起直接读回），所以每次写入都能读回自校验。
-- 出处：社区插件 `refs/signalrgb-maxsun/Maxsun_ENE_Chip_6k7750.js`（作者 Sky），只作协议参考；源码里**没有任何固件/刷写操作**，不会刷砖。
-- 实测开销（`examples/rgb_probe.rs bench`，WinUSB，单个输出）：握手读 2.28 ms + 提交读与数据写 1.61 ms（128 灯）+ 5 个控制写 0.91 ms + 整帧提交 0.70 ms ≈ **5.5 ms/输出**（48 灯时 ≈4.8 ms）。参考插件每帧写 4 个输出，且作者在源码里注明「帧率超过 20 就会卡顿、刷新更慢」——**SignalRGB 灯效发卡的来源是这条传输预算（外加它自己的渲染开销），不是硬件坏**。我们自己的实现要按这个预算来：只写颜色真的变了的通道、载荷按真实灯珠数、静态色只写一次、动态效果限帧。
-- 灯也要守「单一控制者」：接管期间不要同时开 SignalRGB 主程序或铭瑄灯控，两边会互相覆盖（社区文档提到更坏的情况是设备锁死）。想交还给主板：重启一次，或让程序写 `mode=0x00` 退出直控模式。
-
-### 怎么用（v1）
-
-- **配置文件 `fantune-rgb.json`（exe 旁边）本身就是"允许接管灯"的授权**：没有这个文件，程序一个字都不写灯（面板会写"未接管"）。初始版本用 `rgb-tool init` 生成——两条 ARGB 链、标记为未校准、CH1 绿 / CH2 蓝，用来做物理识别。
-- **面板顶部「灯效」区**：接管开关 / 让给校准 / 还灯给系统；每条链一行（策略、形状、材质、校准旋钮），加一行全局（亮度、饱和、刷新上限、退出后是否保留灯色）。
-- **策略**：固定色 / 温度色阶 / 温度水位（环形从相位点往上填、条状从起点往后填）/ 占空色 / 状态色（标准/游戏/服务器/静音/全速/告警，优先级：告警 > 全速 > 静音 > profile）。温度源和风扇曲线同一套 key（`nct:PECI_0 (CPU)`、`gpu:0`、`nvme:0`…），所以两侧看到的是同一份温度。
-- **材质（diffusion）**决定渲染方式：柔光罩=平滑渐变、导光条/显卡缝=少而宽的大色块（防串色发糊）、裸灯珠=分块+抖动、整块同色=只取主色。效果只写意图，由这一层翻译——这是"每种灯看起来都好看"的关键。
-- **校准工具 `rgb-tool.exe`**（单独二进制、**不带管理员清单**，普通 shell 直接跑；主 `fan-tune.exe` 带 requireAdministrator，命令行会弹 UAC）：
-
-  | 命令 | 用途 |
-  |---|---|
-  | `read` | 设备寄存器 + 每条链当前颜色（读回） |
-  | `profile` | 打印灯光配置 |
-  | `set --ch1 RRGGBB [--ch2 …]` | 写静态色并读回校验 |
-  | `walk --ch 1 --count 48` | 逐颗点亮：数灯珠数量、看链条方向 |
-  | `sweep --secs 12` | 平滑度测试（用眼睛判断卡不卡） |
-  | `bench` | 实测写入成本 |
-  | `apply --cpu 50 --gpu 60 --duty 0:45` | 用给定传感器值渲染一次，验证效果逻辑 |
-  | `release` | 还灯给主板 |
-
-- **一个接口同时只能有一个句柄**（WinUSB 的限制）：主程序运行时 `rgb-tool` 打不开设备。要校准先在面板点「让给校准」（放开句柄、灯保持当前颜色），校准完取消勾选重新接管。
-- **实测**（本机、WinUSB）：一次"输出颜色变化"的写入 **3.44 ms**（128 灯珠）——参考插件 5.5 ms，差在它每帧还重发一轮作者自己都说没用的握手读；**颜色不变就完全不发**，静态效果稳态零流量，5 fps 的慢变效果下整机 CPU 仍是 ~1.1% 单核（与加灯前一致，见"性能"节）。
-- **退出行为**可配：默认"保留灯色"（控制器自己保持，不闪），取消勾选则退出时把灯交回主板自己的灯效。
+Full Chinese usage notes (per-field config reference, the logon autostart
+task, troubleshooting): [`USAGE.zh-CN.md`](USAGE.zh-CN.md).
 
 
-## 搬到别的电脑（移植清单）
-- **芯片**：支持这一批（寄存器表来自 LibreHardwareMonitor Nct677X.cs）：
+- **Sensors** — CPU temp/load, 7 fan channels (RPM + duty), board voltages, NVMe
+  temps, GPU (temp/util/VRAM/power/fan), RAM usage
+- **Control** — manual duty, draggable temperature curve, or BIOS auto
+- **Budget mode** — a closed-loop thermostat: hold a temperature inside a band
+  with the least duty that keeps it there, and probe downward to find the
+  quietest sufficient level. This is the part worth reading; see
+  [`docs/budget-mode-design.md`](docs/budget-mode-design.md)
+- **Profiles** — Standard / Gaming (curves evaluated as if `+5 °C` warmer, so the
+  ramp engages earlier while idle stays just as quiet) / Server (rate-limited,
+  never oscillates, per-channel thermal guard)
+- **Lights** — ENE 6k7750 ARGB controller over WinUSB, no ring-0 needed
+- **Daemon / tray** — one process owns the hardware at all times; the GUI takes
+  over on start and hands back on exit
 
-  | 芯片 | 通道数 | 说明 |
-  |---|---|---|
-  | NCT6779D（rev 0x6x） | 5 | Z370 时代很常见 |
-  | NCT6791D / 6792D / 6792D-A / 6793D / 6795D | 6 | |
-  | NCT6796D / NCT6796D-R | 6 / 7 | 本机是后者 |
-  | NCT6797D / NCT6798D | 7 | |
-  | NCT6701D | 7 | |
+## Which machines it drives
 
-  **能认出来但故意不驱动**（会报出芯片名和原因，而不是硬写错寄存器）：
-  NCT6683D / 6686D / 6687D / 6687DR（走 EC 空间，另一套读写协议 + 手动控速需要握手时序）、
-  NCT6796DS / NCT5585D / NCT6799D（与别的芯片同 id/rev，只凭寄存器分不出来，需要主板型号白名单）、
-  NCT6771F / 6776F / NCT610XD（没有可写的风扇控制寄存器）。
-  程序检测到芯片后**只按该芯片的通道数写**：多出来的通道（比如 6 风扇芯片的第 7 通道）寄存器属于别的功能，一律拒写
-- **通道角色**：哪条通道接的是水泵/冷排完全取决于主板。现在面板上就能改：曲线编辑区展开「算法设置」→「通道绑定」里有 **交给本程序** / **保护** 两个开关，旁边有**「识别」按钮**（让该通道满速转 3 秒，靠听声辨位认接口，结束后自动交还原设定）
-- **传感器工具**：硬盘温度需要 smartmontools 的 `smartctl.exe`。查找顺序：环境变量 `FANTUNE_SMARTCTL` → `%USERPROFILE%\scoop\shims` → `%ProgramFiles%\smartmontools\bin` → PATH。装在别处就设 `FANTUNE_SMARTCTL`
-- **显卡**：只支持 NVIDIA（走 `nvidia-smi`，可用 `FANTUNE_NVIDIA_SMI` 指定路径）。非 N 卡时 `gpu:0` 源读不到 → 只配了该源的通道连续 5 次失败后会进 70% 安全占空
-- **盘位索引**：`nvme:0/1/2` 对应 `/dev/sda|sdb|sdc` 的枚举顺序（位置即索引）。换盘/加盘后要核对该盘是不是你以为的那块；顺序不对用 `FANTUNE_DRIVES=sd0,sd1` 覆盖
-- **驱动**：两种后端，程序自动选（`fan-tune-driver.log` 会写明用的是哪种）：
-  1. **PawnIO**（装了就用它）：微软签名驱动 + 签名模块，不在易受攻击驱动名单里，不会被 Defender 报 HackTool、不受内存完整性影响。装法：从 pawnio.eu 装驱动（约 5 MB，LHM / FanControl 也是这么装的），`LpcIO.bin` / `IntelMSR.bin` 两个模块放在 exe 旁边（本仓库 `driver/` 里已备好，模块是 LGPL-2.1，见 `driver/PAWNIO-MODULES-LICENSE.txt`）
-     - ⚠️ **模块的端口白名单**：`LpcIO` 模块只放行"配置口 0x2E/0x2F（或 0x4E/0x4F）+ 已发现的 BAR"。必须在**进入配置模式、芯片 ID 有效之后**调用 `ioctl_find_bars`，否则 EC 寄存器窗口（0x290+5/6）的每次访问都会被 `STATUS_ACCESS_DENIED` 挡掉、读回 0x00，表现为"找不到芯片"。这条已在 `nct.rs` 的检测流程里实现（`pawnio_select_slot` → 进配置模式 → 校验 ID → `pawnio_find_bars`）
-     - 代价：单次端口操作比 WinRing0 的原生 IOCTL 慢（模块是解释执行的），但**整体 CPU 实测没差别**（同状态 WinRing0 25.3% vs PawnIO 22.8%，都在噪声内）——本程序的 CPU 原本全被一个重绘 bug 吃掉了，见「性能」一节。所以选后端看的是可靠性：PawnIO 不会被封、不用注册内核服务、交接瞬间完成（不再有 30 秒服务互搏 + 驱动卡 2 分钟）；WinRing0 的优点是 .sys 就在本地、装了就能用
-  2. **WinRing0x64.sys**（兜底）：自己注册服务加载。必须和 exe 同目录、需要管理员权限（清单由 `update_manifest.ps1` 写入）。⚠️ 它已被微软列入易受攻击驱动黑名单：开着**内存完整性（HVCI）/智能应用控制**的机器会拒载，Defender 也可能报 `HackTool:Win32/Winring0`。启动时若驱动打不开，程序会**自动检查这几项并直接告诉你原因**（HVCI 开着 / 智能应用控制开着 / 驱动文件被隔离了），并提示装 PawnIO
-- **单一控制者的保证**：`fan-tune-hardware.lock`（exe 旁边，0 字节）被**独占打开**，谁持有谁是唯一控制者。以前这条保证是 WinRing0 设备"独占打开"顺带给的，PawnIO 是共享打开，所以改成显式锁——换后端也不会出现两个程序同时写风扇
-- **重新注册自启**：新机器上管理员运行 `fan-tune.exe install`
-- **日志时间**：按系统时区（旧版写死 UTC+8）
-- **界面字体**：用微软雅黑 / SimHei，非中文 Windows 缺这两个字体时中文会显示成方框
+Chip detection covers the NCT6779D..NCT6799D family. The register tables come
+from LibreHardwareMonitor (`refs/vendor/`).
 
-## 更新/重新编译流程（⚠️ 永远不要强杀进程）
-1. 维护性停止：`echo stop > target/release/fan-tune-gui-stop.req`
-   （维护性退出**不写配置、不再自动拉起后继**——exe 随之解锁）
-2. `cargo build --release`
-3. `powershell -File update_manifest.ps1`（重嵌提权清单）
-4. `schtasks /Run /TN FanTune` 拉起新版
-- **普通退出**（托盘"退出"/关窗）：自动派生后继实例、设备句柄重叠 8 秒后旧实例才退——控制不断档、驱动不卡顿
-- **绝不要用 `schtasks /End` 或 taskkill 强杀**——内核驱动会卡约 1 分钟（会自愈，但没必要）
-- **别连着做多轮停/启**：实测连续两次维护停止+重启后，驱动会进入"服务 RUNNING 但设备打不开"的卡住态，需要约 2 分钟自愈（GUI 的 8 轮×30s 重试正好覆盖，期间没有控制者、风扇停在最后一次占空比）。要改代码就一次改完再重启
-- 旧版仍在跑又不想停它：`mv fan-tune.exe fan-tune-running.exe` 改名换位再编译；新版在下次重启/退出周期接手（程序启动时会自动清理该残留文件）
+Some chips are **recognised but deliberately not driven** — they report a reason
+instead of being poked:
 
-## 开发注意
-- **每次 `cargo build` 重新编译后，必须重跑 `update_manifest.ps1`**
-  （MinGW 链接器会注入自带的 asInvoker manifest，这个脚本用系统 API
-  把 requireAdministrator 写回 exe 资源段，否则双击不会弹 UAC）
+- NCT6683D / 6686D / 6687D — EC-space access, a different protocol
+- NCT6796DS / 6799D — share an id/revision with a different chip; the fan
+  registers differ and writing the wrong ones could hit another function
+- NCT6771F / 6776F / 610XD — read-only, no writable fan registers
 
-## 命令行模式
-- `fan-tune.exe read` — 打印全部传感器（风扇转速/温度/电压/NVMe）
-- `fan-tune.exe set 0 75` — 把通道0设为75%转速
-- `fan-tune.exe daemon` — 按 fantune.json 曲线循环控制（后台）
-- `fan-tune.exe gui` — 图形界面
+If your chip is not in the table, `detect` says so and exits. It will not guess.
 
-## 曲线配置文件 fantune.json
-- channel 0/1 已按你之前的策略配好（磁盘温度曲线）
-- 泵（Fan #5 = 通道5，即 BIOS 的 Fan #6）保持不动：靠 `enabled: false` 实现（程序完全不写它），不是靠"别点"——README 这句现在是代码保证的
-- 温度源：`nvme:0` = 第一块硬盘（致态），`nct:PECI_0 (CPU)` = CPU，`gpu:0` = 显卡
-- **`enabled`**：true = 按 `mode` 管；false = 程序完全不碰这个通道（曲线、手动、一键全速/静音、温度源失效兜底都不写），只由 BIOS 控制
-- **`protected`**：true = 只跟自己的曲线/手动设定，一键全速、静音、兜底都不动它（给水泵这类不能随便降速的部件留的后路）
-- 这两个开关和「识别」按钮都在面板上：曲线编辑区 →「算法设置」→「通道绑定」（见「硬件说明」上方的移植清单）
-- **配置写盘是安全的**：临时文件 + 原子替换，断电不会留下半个文件；写坏了会改用 `fantune.json.bak` 并把坏文件挪成 `fantune.json.corrupt`，然后弹窗告诉你——不会静默回默认值（旧版会，等于悄悄抹掉所有曲线）
-- 同目录侧车文件：`fantune.json.bak`（上一版）、`fantune-originals.json`（首次接管前抓到的 BIOS 风扇寄存器原值，用来"恢复 BIOS 自动"，程序重启后也还能还回去；**跨重启自动作废**，因为重启后 BIOS 会重新初始化芯片，那时重新抓到的才是真原值）
+## Building
 
-## 文件布局（全部在 `桌面\fan-tune\` 一个文件夹里）
-- `src/` — 源码；`Cargo.toml` / `build.rs` — 工程文件
-- `target\release\` — 运行目录：fan-tune.exe + WinRing0x64.sys + `LpcIO.bin`/`IntelMSR.bin`（PawnIO 模块）+ fantune.json（配置）+ `fan-tune-hardware.lock`（单控制者锁）+ 日志
-- `refs/` — LibreHardwareMonitor 参考源码（MPL 2.0 许可）
-- 脚本：`update_manifest.ps1`（重嵌提权清单）、`ui_shot.ps1`（截图核对）、`update_task_xml.ps1`（任务 XML 备用）
+Requires the **GNU** Rust toolchain on Windows (`windres` from mingw64, `ar`
+from binutils) — `build.rs` embeds a `requireAdministrator` manifest, and fails
+loudly if `ar` is missing rather than shipping an exe that silently cannot
+reach the driver.
 
-## ⚠️ 注意
-- 不要同时手动跑两个控制者（比如又开 GUI 又手动 `fan-tune.exe daemon`）。
-  正常使用路径（双击 GUI / 登录自启 daemon）已经由单一控制者机制保护。
+```sh
+cargo build --release
+```
+
+Then place these next to `fan-tune.exe`:
+
+- `WinRing0x64.sys` (from `driver/`) — only if you use the WinRing0 backend
+- `LpcIO.bin`, `IntelMSR.bin` (from `driver/`) — PawnIO modules
+- `fantune.json` — start from the one in the repo root
+
+`rgb-tool.exe` is separate and does **not** need elevation.
+
+### Ring-0 backends
+
+Two are supported; both are attempted and the order is set by `backend` in
+`fantune.json`.
+
+- **PawnIO** (preferred) — a signed driver that runs signed modules. You install
+  the driver yourself from <https://pawnio.eu>; fan-tune only loads the two
+  modules above into it.
+- **WinRing0** (fallback) — our own kernel service on `WinRing0x64.sys`. Note
+  that Windows blocklists this driver and Defender flags it; HVCI / Smart App
+  Control may refuse to load it.
+
+## Safety notes
+
+- Only one process may write the fan registers. The real guarantee is that the
+  driver device is opened `FILE_SHARE_NONE`, plus an explicit lock file for the
+  PawnIO backend (which opens with sharing).
+- **Temperature source failure**: 5 consecutive passes with no usable reading —
+  including a reading that has gone stale — puts every curve/budget channel at
+  70% until the source recovers. `enabled: false` and `protected: true`
+  channels are never touched.
+- Channels are only driven up to the chip's actual fan count; writes above that
+  are refused, because those registers belong to other functions.
+- On exit, channels in Auto mode are handed back to the BIOS using the register
+  values captured before the first override.
+
+## Repository layout
+
+| | |
+|---|---|
+| `src/algo.rs` | curve engine: EMA, hysteresis, slew limiting, budget loop |
+| `src/control.rs` | one control pass — shared by the GUI and the daemon |
+| `src/nct.rs` | chip register maps and banked EC access (testable: `PortIo`) |
+| `src/driver.rs` | WinRing0 / PawnIO backends |
+| `src/rgb/` | ENE 6k7750 controller (WinUSB, user-mode) |
+| `src/ui/` | egui panel — specific to this machine, not meant to be reused |
+| `docs/` | budget-mode design, hardware upgrade checklist |
+| `refs/vendor/` | upstream sources the register maps were transcribed from |
+
+## Tests
+
+```sh
+cargo test
+```
+
+Runs without elevation. `src/nct.rs` drives a simulated EC space through the
+`PortIo` trait, so the bank cache, the BIOS hand-back and the out-of-range
+guard are covered without a kernel driver.
+
+## Third-party components
+
+- Register maps and the PawnIO protocol transcribed from **LibreHardwareMonitor**
+  (MPL-2.0) — `refs/vendor/LHM-LICENSE`
+- PawnIO modules `LpcIO.bin` / `IntelMSR.bin` — LGPL-2.1, see
+  `driver/PAWNIO-MODULES-LICENSE.txt`. The PawnIO driver itself is not
+  redistributed here.
+- `WinRing0x64.sys` — OpenLibSys 1.2.0, BSD-style (see `refs/vendor/OlsIoctl.h`)
+- ARGB protocol transcribed from the community SignalRGB Maxsun plugin —
+  `refs/vendor/Maxsun_ENE_Chip_6k7750.js`
+- Geist Mono — SIL Open Font License, `src/ui/fonts/OFL.txt`
+
+## License
+
+MIT — see [LICENSE](LICENSE).
