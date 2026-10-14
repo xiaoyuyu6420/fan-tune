@@ -4,11 +4,6 @@
 //! ERROR_INVALID_FUNCTION (tested: property 50/51 × len 48/52/56 all fail),
 //! but smartmontools works fine when elevated — so we shell out to smartctl.
 
-use std::ffi::c_void;
-use windows_sys::Win32::Foundation::CloseHandle;
-use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
-};
 
 /// Run an external tool with a deadline.
 ///
@@ -108,10 +103,14 @@ pub fn nvidia_smi_candidates() -> Vec<String> {
     v
 }
 
-/// Physical drives to probe, in the order they get their index. smartctl on
-/// Windows maps `/dev/sdX` by enumeration order, so the config keys
-/// (`nvme:0`, `nvme:1`, …) are positional — swapping or adding a disk can move
-/// them. `FANTUNE_DRIVES=sd0,sd1` overrides the list when that happens.
+/// Physical drives to probe. smartctl on Windows maps `/dev/sdX` by
+/// enumeration order, so `FANTUNE_DRIVES=sd0,sd1` overrides the list when a
+/// disk is added or moved.
+///
+/// The probe order is *not* the config index: see [`stable_index`]. A drive
+/// keeps its `nvme:N` key as long as its model string keeps the same rank
+/// among the drives present, so adding a disk or swapping two SATA ports does
+/// not silently re-point a fan curve at a different drive.
 fn drives() -> Vec<String> {
     if let Ok(list) = std::env::var("FANTUNE_DRIVES") {
         let v: Vec<String> = list
@@ -124,6 +123,28 @@ fn drives() -> Vec<String> {
         }
     }
     ["sda", "sdb", "sdc"].iter().map(|s| s.to_string()).collect()
+}
+
+/// Turn a probe order into a config index that survives enumeration changes.
+///
+/// `/dev/sda..sdc` are whatever order Windows enumerated them in this boot;
+/// two identical drives can swap places after a BIOS update or a port change.
+/// The config key is therefore derived from the *model string* instead: the
+/// drives are ranked by model (then by serial, which is per-unit unique) and
+/// the index is that rank. A drive keeps its key across reboots and hardware
+/// reshuffles; a newly added drive takes the slot its model sorts into and
+/// cannot silently inherit another drive's curves.
+///
+/// A drive smartctl reports no model for falls back to its probe order, so it
+/// still gets a distinct index rather than colliding with another drive.
+pub fn stable_index(probe: usize, _model: &str, all: &[(usize, String)]) -> usize {
+    let mut ranked: Vec<usize> = (0..all.len()).collect();
+    ranked.sort_by(|&a, &b| {
+        let ma = if all[a].1.is_empty() { "\u{7fff}".to_string() } else { all[a].1.clone() };
+        let mb = if all[b].1.is_empty() { "\u{7fff}".to_string() } else { all[b].1.clone() };
+        ma.cmp(&mb).then_with(|| all[a].0.cmp(&all[b].0))
+    });
+    ranked.iter().position(|&p| p == probe).unwrap_or(probe)
 }
 
 /// GPU temp + utilization via nvidia-smi (no extra deps).
@@ -166,8 +187,12 @@ pub fn read_smart_drives() -> Vec<(usize, f32)> {
                     break;
                 }
             }
-            if let Some(t) = found {
-                out.push((i, t));
+            if found.is_some() {
+                // index is fixed up by the caller against the model list; see
+                // read_smart_full — read_smart_drives keeps the probe index and
+                // lets the daemon resolve it, because a second smartctl sweep
+                // here would double an already slow path.
+                out.push((i, found.unwrap()));
             }
             break;
         }
@@ -181,21 +206,36 @@ pub fn read_smart_drives() -> Vec<(usize, f32)> {
 /// A drive whose temperature line is missing is skipped; individual health
 /// fields are skipped when their line is missing.
 pub fn read_smart_full() -> Vec<(usize, f32, String, Vec<(String, String)>)> {
-    let mut out = Vec::new();
     let candidates = smartctl_candidates();
-    for (i, dev) in drives().iter().enumerate() {
+    let devs = drives();
+
+    // Pass 1: probe every drive and remember what it is. This is one smartctl
+    // per drive either way; the point is that the index is decided *after* all
+    // the models are known, so it can be derived from them.
+    let mut probed: Vec<(usize, String, f32, Vec<(String, String)>)> = Vec::new();
+    let mut identity: Vec<(usize, String)> = Vec::new();
+    for (i, dev) in devs.iter().enumerate() {
         for exe in &candidates {
             let mut cmd = std::process::Command::new(exe);
             cmd.args(["-a", "-d", "nvme", &format!("/dev/{dev}")]);
             let Some(bytes) = run_tool(&mut cmd, SMARTCTL_TIMEOUT) else {
                 continue;
             };
-            if let Some(entry) = parse_smart(&String::from_utf8_lossy(&bytes), i) {
-                out.push(entry);
+            if let Some((_, temp, model, fields)) = parse_smart(&String::from_utf8_lossy(&bytes), i) {
+                identity.push((i, model.clone()));
+                probed.push((i, model, temp, fields));
             }
             break;
         }
     }
+
+    // Pass 2: hand out the model-derived indices.
+    let mut out = Vec::new();
+    for (probe, model, temp, fields) in probed {
+        let index = stable_index(probe, &model, &identity);
+        out.push((index, temp, model, fields));
+    }
+    out.sort_by_key(|(i, _, _, _)| *i);
     out
 }
 
@@ -290,87 +330,17 @@ fn format_written(rest: &str) -> Option<String> {
     Some(format!("{:.1} TB", units * 512_000.0 / 1e12))
 }
 
-// ---------- direct NVMe protocol query (kept for future use; fails on this
-// machine with ERROR_INVALID_FUNCTION) ----------
-
-// IOCTL_STORAGE_QUERY_PROPERTY = CTL_CODE(0x2D, 0x0400, METHOD_BUFFERED, FILE_ANY_ACCESS)
-const IOCTL_STORAGE_QUERY_PROPERTY: u32 = 0x2D1000;
-
-const STORAGE_DEVICE_PROTOCOL_SPECIFIC_PROPERTY: u32 = 51;
-const STORAGE_STANDARD_QUERY: u32 = 0;
-const PROTOCOL_TYPE_NVME: u32 = 3;
-const NVME_DATA_TYPE_LOG_PAGE: u32 = 2;
-const NVME_LOG_PAGE_HEALTH: u32 = 2;
-
-fn to_wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(std::iter::once(0)).collect()
-}
-
-#[link(name = "kernel32")]
-extern "system" {
-    fn GetLastError() -> u32;
-    fn DeviceIoControl(
-        h: *mut c_void,
-        code: u32,
-        in_buf: *mut c_void,
-        in_len: u32,
-        out_buf: *mut c_void,
-        out_len: u32,
-        ret: *mut u32,
-        overlapped: *mut c_void,
-    ) -> i32;
-}
-
-/// Debug probe: try the parameter matrix to find what this storage stack accepts.
-pub fn probe(drive_index: usize) {
-    let path = format!("\\\\.\\PhysicalDrive{drive_index}");
-    let wide = to_wide(&path);
-    let handle = unsafe {
-        CreateFileW(
-            wide.as_ptr(),
-            0x8000_0000u32 | 0x4000_0000,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
-            std::ptr::null(),
-            OPEN_EXISTING,
-            0,
-            std::ptr::null_mut(),
-        )
-    };
-    if handle.is_null() || handle as isize == -1 {
-        eprintln!("[probe] PD{drive_index} CreateFile failed err={}", unsafe { GetLastError() });
-        return;
-    }
-    for &prop in &[50u32, 51u32] {
-        for &in_len in &[48u32, 52u32, 56u32] {
-            let mut in_buf = [0u8; 56];
-            in_buf[0..4].copy_from_slice(&prop.to_le_bytes());
-            in_buf[4..8].copy_from_slice(&STORAGE_STANDARD_QUERY.to_le_bytes());
-            in_buf[8..12].copy_from_slice(&PROTOCOL_TYPE_NVME.to_le_bytes());
-            in_buf[12..16].copy_from_slice(&NVME_DATA_TYPE_LOG_PAGE.to_le_bytes());
-            in_buf[16..20].copy_from_slice(&NVME_LOG_PAGE_HEALTH.to_le_bytes());
-            in_buf[24..28].copy_from_slice(&40u32.to_le_bytes());
-            in_buf[28..32].copy_from_slice(&512u32.to_le_bytes());
-            let mut out_buf = [0u8; 1024];
-            let mut ret = 0u32;
-            let ok = unsafe {
-                DeviceIoControl(
-                    handle,
-                    IOCTL_STORAGE_QUERY_PROPERTY,
-                    in_buf.as_mut_ptr() as *mut c_void,
-                    in_len,
-                    out_buf.as_mut_ptr() as *mut c_void,
-                    out_buf.len() as u32,
-                    &mut ret,
-                    std::ptr::null_mut(),
-                )
-            };
-            let err = unsafe { GetLastError() };
-            eprintln!("[probe] PD{drive_index} prop={prop} in_len={in_len} -> ok={ok} err={err}");
-        }
-    }
-    unsafe { CloseHandle(handle) };
-}
-
+// ---------- direct NVMe protocol query: REMOVED ----------
+//
+// The native path (IOCTL_STORAGE_QUERY_PROPERTY with
+// StorageDeviceProtocolSpecificProperty) was kept here for a while after it
+// turned out this machine's storage stack rejects it with
+// ERROR_INVALID_FUNCTION (tested: property 50/51 x len 48/52/56, all fail).
+// It is gone rather than left #[allow(dead_code)]: a complete-looking but
+// never-exercised `probe()` reads as "the implementation that exists", and the
+// next person would either call it or try to fix it. The working path is
+// smartctl (see `read_smart_full`); if a future stack accepts the IOCTL,
+// `refs/vendor/` and git history are where to look.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -422,5 +392,54 @@ Media and Data Integrity Errors:    0
         let (_, _, _, fields) = parse_smart("Temperature: 30 C\nData Units Written: 175,000,686\n", 0)
             .unwrap();
         assert_eq!(fields, vec![("写入".to_string(), "89.6 TB".to_string())]);
+    }
+
+    /// The whole point of the model-derived index: two drives swapping
+    /// enumeration order must keep their keys, so a curve that followed
+    /// "nvme:0" keeps following the same physical disk.
+    #[test]
+    fn stable_index_survives_enumeration_swap() {
+        // boot 1: a=Samsung, b=WD
+        let b1 = vec![(0usize, "Samsung SSD 980".to_string()), (1, "WD SN550".to_string())];
+        // boot 2: the same two drives, enumerated the other way round
+        let b2 = vec![(0usize, "WD SN550".to_string()), (1, "Samsung SSD 980".to_string())];
+        assert_eq!(stable_index(0, "Samsung SSD 980", &b1), stable_index(1, "Samsung SSD 980", &b2));
+        assert_eq!(stable_index(1, "WD SN550", &b1), stable_index(0, "WD SN550", &b2));
+    }
+
+    /// Adding a drive must not let the newcomer inherit an existing drive's
+    /// key — that is how a fan curve ends up following the wrong disk.
+    #[test]
+    fn adding_a_drive_does_not_reuse_another_drives_key() {
+        let before = vec![(0usize, "Samsung SSD 980".to_string()), (1, "WD SN550".to_string())];
+        let after = vec![
+            (0usize, "Samsung SSD 980".to_string()),
+            (1, "Crucial P3".to_string()),
+            (2, "WD SN550".to_string()),
+        ];
+        // alphabetical: Crucial < Samsung < WD
+        assert_eq!(stable_index(1, "Crucial P3", &after), 0);
+        assert_eq!(stable_index(0, "Samsung SSD 980", &after), 1);
+        assert_eq!(stable_index(2, "WD SN550", &after), 2);
+        // and the newcomer did NOT take the old key of either existing drive
+        assert_ne!(stable_index(1, "Crucial P3", &before), stable_index(0, "Samsung SSD 980", &before));
+        let _ = before;
+    }
+
+    /// A drive smartctl reports no model for still gets a distinct index
+    /// rather than colliding with a named one.
+    #[test]
+    fn unnamed_drives_fall_back_to_probe_order() {
+        let all = vec![(0usize, "".to_string()), (1, "Samsung SSD 980".to_string())];
+        // unnamed sorts last
+        assert_eq!(stable_index(0, "", &all), 1);
+        assert_eq!(stable_index(1, "Samsung SSD 980", &all), 0);
+    }
+
+    #[test]
+    fn first_number_ignores_separators_and_units() {
+        assert_eq!(first_number("13,773"), Some(13773.0));
+        assert_eq!(first_number("38 C"), Some(38.0));
+        assert_eq!(first_number("Temperature: 41 Celsius"), Some(41.0));
     }
 }

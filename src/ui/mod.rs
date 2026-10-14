@@ -240,6 +240,10 @@ fn ram_info() -> Option<(f32, f32, f32)> {
     // why this used to silently report 0/0 GB.
     #[repr(C)]
     struct MSX { dw_length: u32, dw_memory_load: u32, total: u64, avail: u64, total_page: u64, avail_page: u64, total_virt: u64, avail_virt: u64, avail_ext: u64 }
+    // The call is rejected unless dwLength == sizeof(MEMORYSTATUSEX) == 64,
+    // and the failure mode is a silent 0/0 GB report rather than an error —
+    // this already happened once. Pin the size so it cannot happen again.
+    const _: () = assert!(std::mem::size_of::<MSX>() == 64);
     #[link(name = "kernel32")]
     extern "system" {
         fn GlobalMemoryStatusEx(p: *mut MSX) -> i32;

@@ -24,6 +24,8 @@ const FILE_SHARE_READ: u32 = 0x0000_0001;
 const FILE_SHARE_WRITE: u32 = 0x0000_0002;
 const OPEN_EXISTING: u32 = 3;
 const FILE_ATTRIBUTE_NORMAL: u32 = 0x0000_0080;
+/// Same numeric value as GENERIC_WRITE, but a different parameter: this one
+/// is `dwFlagsAndAttributes`, not the access mask.
 const FILE_FLAG_OVERLAPPED: u32 = 0x4000_0000;
 const INVALID_HANDLE_VALUE: isize = -1;
 
@@ -67,6 +69,10 @@ struct SpDeviceInterfaceData {
     flags: u32,
     reserved: usize,
 }
+// SP_DEVICE_INTERFACE_DATA: `Reserved` is UINT_PTR, so the size is
+// pointer-width. A wrong size makes SetupDi calls fail in ways that look like
+// "no such device" rather than "wrong struct".
+const _: () = assert!(std::mem::size_of::<SpDeviceInterfaceData>() == std::mem::size_of::<usize>() + 24);
 
 #[repr(C)]
 #[derive(Clone, Copy)]
