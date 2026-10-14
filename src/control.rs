@@ -168,6 +168,14 @@ impl ControlPass {
             // return that left `source_fail` at 0 here is what let a wedged
             // sensor thread hold the fans on a frozen temperature for ever.
             out.failures = 1;
+            if !self.safe_mode {
+                log(&format!(
+                    "source failure: temps={} age={:?}ms (stale>= {}ms)",
+                    input.temps.len(),
+                    input.data_age_ms,
+                    STALE_DATA_MS
+                ));
+            }
         } else if let Some(duty) = input.overlay {
             for (i, c) in cfg.channels.iter().enumerate().take(hw.fan_count()) {
                 // Hands-off channels (pump, or `enabled: false`) are not
@@ -236,6 +244,12 @@ impl ControlPass {
                         // a curve/budget channel with no data is a real failure
                         if matches!(c.mode, FanMode::Curve | FanMode::Budget) {
                             out.failures += 1;
+                            if !self.safe_mode {
+                                log(&format!(
+                                    "channel {i} ({}): no temperature resolved",
+                                    c.source
+                                ));
+                            }
                         }
                     }
                 }
