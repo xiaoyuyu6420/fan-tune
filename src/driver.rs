@@ -126,9 +126,25 @@ impl HardwareLock {
     }
 }
 
-// NOTE: no Drop — like the device handles, this is released by the OS when the
-// process ends. An explicit close would release ownership while clones of
-// `Driver` are still writing to the chip.
+impl Drop for HardwareLock {
+    fn drop(&mut self) {
+        // Close the handle so the lock can be taken again.
+        //
+        // There used to be no Drop here, on the grounds that closing it might
+        // release ownership while clones of `Driver` were still writing. That
+        // danger does not exist: `Driver` holds `Arc<HardwareLock>`, so the
+        // handle outlives every clone by construction.
+        //
+        // Without a Drop the lock leaks for the process lifetime, and
+        // `install_and_open` re-acquires on every one of its retries — so a
+        // first failed attempt left every later attempt unable to ever take
+        // ownership. Measured: after one acquire+drop, acquire never succeeds
+        // again (see the test below).
+        unsafe {
+            CloseHandle(self.handle);
+        }
+    }
+}
 
 /// Read a module file: next to the exe first, then the repo's `driver/` dir so
 /// a source-tree build works without deploying.
@@ -572,9 +588,6 @@ fn to_wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-/// Append a diagnostic line to fan-tune-driver.log (cwd-relative, next to the
-/// other logs). The GUI has no console — this is the durable trace of driver
-/// bring-up, which matters because boot-time failures are transient.
 /// Diagnose the environment when ring-0 access fails.
 ///
 /// Windows security features that enforce the vulnerable-driver blocklist, and
@@ -645,6 +658,9 @@ fn reg_dword(key: &str, value: &str) -> Option<u32> {
     u32::from_str_radix(hex.trim_start_matches("0x"), 16).ok()
 }
 
+/// Append a diagnostic line to fan-tune-driver.log (next to the other logs).
+/// The GUI has no console — this is the durable trace of driver bring-up,
+/// which matters because boot-time failures are transient.
 fn dlog(msg: &str) {    use std::io::Write;
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
@@ -901,3 +917,34 @@ const _: () = {
     // touch SERVICE_STOPPED so the import isn't flagged unused on some versions
     let _ = SERVICE_STOPPED;
 };
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `HardwareLock` is what enforces the single-controller guarantee for the
+    /// PawnIO backend (WinRing0 gets it from `FILE_SHARE_NONE` on the device,
+    /// PawnIO does not). So it must be exclusive while held — and it must be
+    /// released once nobody holds it, because `install_and_open` re-acquires on
+    /// every one of its 20 retries.
+    #[test]
+    fn hardware_lock_is_exclusive_and_released_on_drop() {
+        let first = HardwareLock::acquire();
+        assert!(first.is_some(), "first acquire must succeed");
+
+        // exclusive: a second opener must fail while the first is held
+        assert!(HardwareLock::acquire().is_none(), "a second live lock must be refused");
+        drop(first);
+
+        // and it must become available again — install_and_open re-acquires on
+        // every one of its retries, so a lock that leaks would leave every
+        // later attempt unable to take ownership.
+        let second = HardwareLock::acquire();
+        assert!(second.is_some(), "the lock must be released on drop");
+        drop(second);
+        assert!(
+            HardwareLock::acquire().is_some(),
+            "still releasable after a second round trip"
+        );
+
+    }
+}

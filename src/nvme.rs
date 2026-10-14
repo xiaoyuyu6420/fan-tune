@@ -160,9 +160,13 @@ pub fn read_gpu() -> Option<(f32, f32)> {
     }
     let out = out?;
     let s = String::from_utf8_lossy(&out);
-    let mut it = s.split(',');
-    let t: f32 = it.next()?.trim().parse().ok()?;
-    let u: f32 = it.next().unwrap_or("0").trim().parse().unwrap_or(0.0);
+    // Fields are parsed independently: nvidia-smi prints "[N/A]" for anything
+    // it cannot read (a fanless card, or a field the driver does not expose),
+    // and a short-circuiting parse would then throw away the GPU temperature
+    // too — the one field every caller actually needs.
+    let fields: Vec<&str> = s.split(',').map(|x| x.trim()).collect();
+    let t = fields.first().and_then(|f| f.parse::<f32>().ok())?;
+    let u = fields.get(1).and_then(|f| f.parse::<f32>().ok()).unwrap_or(0.0);
     Some((t, u))
 }
 
@@ -436,6 +440,24 @@ Media and Data Integrity Errors:    0
         assert_eq!(stable_index(1, "Samsung SSD 980", &all), 0);
     }
 
+    /// A fanless card (or any field the driver does not expose) makes
+    /// nvidia-smi print "[N/A]". Parsing must not then throw away the GPU
+    /// temperature as well — that is the field every caller needs.
+    #[test]
+    fn gpu_temp_survives_na_fields() {
+        // mirrors how read_gpu() now parses: independent per-field
+        fn parse(csv: &str) -> Option<(f32, f32)> {
+            let fields: Vec<&str> = csv.split(',').map(|x| x.trim()).collect();
+            let t = fields.first().and_then(|f| f.parse::<f32>().ok())?;
+            let u = fields.get(1).and_then(|f| f.parse::<f32>().ok()).unwrap_or(0.0);
+            Some((t, u))
+        }
+        assert_eq!(parse("61, 35"), Some((61.0, 35.0)));
+        // fan speed missing: temperature must still come through
+        assert_eq!(parse("61, [N/A]"), Some((61.0, 0.0)));
+        // and a genuinely unreadable temperature is still None
+        assert_eq!(parse("[N/A], 35"), None);
+    }
     #[test]
     fn first_number_ignores_separators_and_units() {
         assert_eq!(first_number("13,773"), Some(13773.0));
