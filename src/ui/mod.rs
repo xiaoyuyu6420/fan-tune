@@ -28,6 +28,30 @@ use fan_tune::rgb::{self, Diffusion, RgbEngine, RgbProfile, Shape, Strategy};
 mod theme;
 
 #[inline]
+/// Over-temperature warnings for the banner. Extracted because the same two
+/// thresholds also decide the light controller's `alert` input — two copies
+/// would drift, and "the fans are blowing but the banner says nothing" is
+/// exactly the kind of disagreement that costs an afternoon.
+fn build_alerts(temps: &[(String, f32)], nvme: &[(usize, f32)]) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(t) = temps.iter().find(|(n, _)| n.contains("PECI")).map(|(_, t)| *t) {
+        if t >= ALERT_CPU_C {
+            out.push(format!("CPU {t:.0}°C 过热"));
+        }
+    }
+    for (i, t) in nvme {
+        if *t >= ALERT_DISK_C {
+            out.push(format!("硬盘 {i} {t:.0}°C 偏高"));
+        }
+    }
+    out
+}
+
+/// True when any alert condition holds — the light controller reads the same
+/// rule as the banner, by construction rather than by copy.
+fn any_alert(temps: &[(String, f32)], nvme: &[(usize, f32)]) -> bool {
+    !build_alerts(temps, nvme).is_empty()
+}
 fn panel() -> egui::Color32 {
     theme::t().panel
 }
@@ -95,6 +119,10 @@ pub const HIST_CAP: usize = 300;
 /// `update`): 0.15 s lead-in + 8 lines × 0.22 s typing + 0.9 s hold + 0.45 s
 /// fade.
 const BOOT_DUR: f32 = 3.4;
+/// CPU (PECI) temperature at or above which the banner warns.
+const ALERT_CPU_C: f32 = 85.0;
+/// Drive temperature at or above which the banner warns.
+const ALERT_DISK_C: f32 = 65.0;
 
 /// One 2-second sample of the history chart.
 #[derive(Clone, Copy, Default)]
@@ -839,9 +867,9 @@ fn rgb_inputs(
         for (i, d) in s.reading.controls_pct.iter().enumerate().take(7) {
             inp.duty[i] = *d;
         }
-        // the same conditions the alert banner fires on
-        inp.alert = s.reading.temps.iter().any(|(n, t)| n.contains("PECI") && *t >= 85.0)
-            || s.nvme.iter().any(|(_, t)| *t >= 65.0);
+        // the same rule as the banner, by construction: one definition, so
+        // the lights cannot disagree with what the panel is telling you
+        inp.alert = any_alert(&s.reading.temps, &s.nvme);
     }
     if let Ok(c) = cfg.lock() {
         inp.profile = match c.profile {
@@ -2849,17 +2877,7 @@ impl eframe::App for App {
         }
 
         // high-temp alert banner
-        let mut alerts: Vec<String> = Vec::new();
-        if let Some(t) = reading.temps.iter().find(|(n, _)| n.contains("PECI")).map(|(_, t)| *t) {
-            if t >= 85.0 {
-                alerts.push(format!("CPU {t:.0}°C 过热"));
-            }
-        }
-        for (i, t) in &nvme {
-            if *t >= 65.0 {
-                alerts.push(format!("硬盘 {i} {t:.0}°C 偏高"));
-            }
-        }
+        let alerts = build_alerts(&reading.temps, &nvme);
 
         // Boot self-test log, built from the *real* machine state (drawn as an
         // overlay at the very end of update, after cfg is published back).
@@ -4462,5 +4480,35 @@ egui::CollapsingHeader::new(theme::tracked_fitted(
                 );
             }
         }
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The banner and the light controller's `alert` input read the same
+    /// function now, so this pins the one rule both of them follow.
+    #[test]
+    fn alerts_fire_at_the_documented_thresholds() {
+        let cpu = |t: f32| vec![("PECI_0 (CPU)".to_string(), t)];
+        assert!(build_alerts(&cpu(84.9), &[]).is_empty());
+        assert_eq!(build_alerts(&cpu(85.0), &[]).len(), 1, "85 C is the CPU threshold");
+        assert!(any_alert(&cpu(90.0), &[]));
+
+        // drives: index and temperature both appear in the message
+        let hot = vec![(0usize, 65.0f32), (1, 40.0)];
+        let a = build_alerts(&[], &hot);
+        assert_eq!(a.len(), 1);
+        assert!(a[0].contains('0'), "names the drive: {a:?}");
+        assert!(!a[0].contains('1'), "a cool drive is not reported");
+    }
+
+    /// A machine with no PECI reading at all must not warn — several boards
+    /// route the CPU probe to a slot this code does not recognise, and a
+    /// banner that fires on nothing is worse than one that never fires.
+    #[test]
+    fn no_peci_reading_means_no_cpu_alert() {
+        let temps = vec![("SYSTIN".to_string(), 95.0), ("CPUTIN".to_string(), 90.0)];
+        assert!(build_alerts(&temps, &[]).is_empty());
     }
 }
