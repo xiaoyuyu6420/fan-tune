@@ -44,6 +44,10 @@ instead of being poked:
 
 If your chip is not in the table, `detect` says so and exits. It will not guess.
 
+Chips differ in fan count — NCT6779D has 5, several have 6, the 6796D-R has 7.
+The config always carries 7 entries, but only the first `fan_count()` are used:
+writes above the count are refused, and the UI shows only real channels.
+
 ## Building
 
 Requires the **GNU** Rust toolchain on Windows (`windres` from mingw64, `ar`
@@ -51,17 +55,39 @@ from binutils) — `build.rs` embeds a `requireAdministrator` manifest, and fail
 loudly if `ar` is missing rather than shipping an exe that silently cannot
 reach the driver.
 
+Requires the **GNU** toolchain (`windres` + `ar` from mingw64). Check with
+`rustup toolchain list` — if only `stable-x86_64-pc-windows-msvc` is installed,
+add `rustup toolchain install stable-x86_64-pc-windows-gnu` and a mingw64 whose
+`bin` is on `PATH`.
+
 ```sh
+# one-time: fetch the third-party runtime assets (see "Runtime assets" below)
+powershell -ExecutionPolicy Bypass -File tools/fetch-driver-assets.ps1
+
 cargo build --release
 ```
 
-Then place these next to `fan-tune.exe`:
-
-- `WinRing0x64.sys` (from `driver/`) — only if you use the WinRing0 backend
-- `LpcIO.bin`, `IntelMSR.bin` (from `driver/`) — PawnIO modules
-- `fantune.json` — start from the one in the repo root
+`build.rs` copies the runtime assets next to the built exe, so
+`target\release\` is deployable as-is. If one is missing it warns and names the
+fetch script rather than failing silently.
 
 `rgb-tool.exe` is separate and does **not** need elevation.
+
+### Runtime assets
+
+`WinRing0x64.sys`, `LpcIO.bin` and `IntelMSR.bin` are third-party binaries and
+are deliberately **not tracked in git**. `tools/fetch-driver-assets.ps1`
+downloads the two PawnIO modules (pinned to the LibreHardwareMonitor v0.9.5 tag
+and SHA-256 verified). `WinRing0x64.sys` has no stable public URL, so it is
+only needed for the WinRing0 fallback backend and must be supplied by hand;
+PawnIO works without it.
+
+### First run
+
+The shipped `fantune.json` leaves every channel `Auto` and `enabled: false`, so
+a first start writes nothing — you choose what to drive. `examples/fantune.example.json`
+is a real tuned config to compare against; note that its `nvme:0` refers to a
+specific drive on the machine it came from.
 
 ### Ring-0 backends
 

@@ -25,7 +25,7 @@ pub enum Shape {
     /// A strip, fan bar or GPU slot: position 0 is one end.
     #[default]
     Line,
-    /// A fan or pump ring: position 0 is wherever [`Segment::phase`] says.
+    /// A fan or pump ring: [`Segment::phase`] rotates where the effect begins.
     Ring,
 }
 
@@ -263,8 +263,14 @@ pub fn render(seg: &Segment, inputs: &Inputs, style: &Style) -> (Vec<[u8; 3]>, M
     };
 
     // --- 2. geometry: reorder so index 0 is the physical start --------------------
-    // `phase` is the hardware LED index that should read as position 0, so the
-    // array is rotated right by it: new[i] = old[(i - phase) mod n].
+    // `phase` shifts where the effect *starts* around the ring: the run that
+    // would have begun at index 0 begins at index `phase` instead. Rotating
+    // right by `phase` does exactly that (new[i] = old[(i - phase) mod n]).
+    //
+    // It does NOT make hardware LED `phase` read as position 0 — that would be
+    // a left rotation. The direction is pinned by
+    // `temp_level_respects_direction_and_ring_phase`: with phase = 3 the lit
+    // run starts at index 3.
     if seg.shape == Shape::Ring && seg.phase > 0 {
         colors.rotate_right((seg.phase as usize) % n);
     }

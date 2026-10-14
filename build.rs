@@ -1,3 +1,42 @@
+
+// Copy the runtime artifacts next to the built exe so a built tree is
+// deployable as-is.
+//
+// These are third-party binaries (see driver/PAWNIO-MODULES-LICENSE.txt and
+// refs/vendor/OlsIoctl.h) and are intentionally NOT tracked in git. They are
+// shipped inside the repo's `driver/` dir when present; if a fresh clone has
+// none, `tools/fetch-driver-assets.ps1` downloads them. A missing file is a
+// warning here, not a hard error: PawnIO-only users need no .sys, and a
+// missing module is reported loudly at runtime with the reason.
+fn deploy_runtime_assets() {
+    let Some(out_dir) = std::env::var_os("OUT_DIR") else {
+        return;
+    };
+    // target/<profile>/build/<pkg>-<hash>/out  ->  target/<profile>
+    let out = std::path::PathBuf::from(out_dir);
+    let Some(profile_dir) = out.ancestors().nth(3) else {
+        return;
+    };
+    let files = ["WinRing0x64.sys", "LpcIO.bin", "IntelMSR.bin"];
+    let mut missing = Vec::new();
+    for f in files {
+        let src = std::path::Path::new("driver").join(f);
+        if !src.exists() {
+            missing.push(f);
+            continue;
+        }
+        if let Err(e) = std::fs::copy(&src, profile_dir.join(f)) {
+            println!("cargo:warning=could not copy {f} to {}: {e}", profile_dir.display());
+        }
+    }
+    if !missing.is_empty() {
+        println!(
+            "cargo:warning=driver assets missing: {}. Run tools/fetch-driver-assets.ps1 \
+             (PawnIO modules are required; WinRing0x64.sys only for the WinRing0 backend).",
+            missing.join(", ")
+        );
+    }
+}
 fn main() {
     // On GNU toolchain we use windres + ar to embed the requireAdministrator
     // manifest (app.rc -> app.manifest) as a PE resource.
@@ -36,4 +75,6 @@ fn main() {
             }
         }
     }
+    deploy_runtime_assets();
 }
+

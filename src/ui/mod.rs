@@ -13,7 +13,6 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::algo::Engine;
 use crate::config::{eval_curve, AppConfig, FanChannelConfig, FanMode, FanProfile, SourceCombine};
 use crate::control::{ControlPass, PassInput, QUIET_DUTY};
 use crate::nct::{Nct, NctReading, FAN_COUNT};
@@ -2512,7 +2511,7 @@ if !prof.calibrated {
             ui.spacing_mut().item_spacing = egui::vec2(2.0, 2.0);
             // channel picker — clicking a card's name also selects,
             // but that alone was not discoverable
-            for i in 0..cfg.channels.len().min(7) {
+            for i in 0..self.nct.fan_count().min(cfg.channels.len()) {
                 let name = channel_display_name(&cfg.channels[i]);
                 if theme::chip_raw(ui, &name, self.selected_fan == i, tk.fg_soft)
                     .on_hover_text("点这里切换要编辑的通道")
@@ -2717,7 +2716,7 @@ impl eframe::App for App {
         }
 
         // frame-local working copies; published back at the end of the frame
-        let mut cfg: AppConfig = self.cfg.lock().unwrap().clone();
+        let mut cfg: AppConfig = self.cfg.lock().unwrap_or_else(|e| e.into_inner()).clone();
         // profile switch requested from the tray menu — applied here so the
         // frame-local copy and the end-of-frame publish-back agree
         let req = self.profile_req.swap(255, Ordering::Relaxed);
@@ -2735,7 +2734,7 @@ impl eframe::App for App {
             };
             self.toast = Some((save_toast(&cfg, msg), Instant::now()));
         }
-        let mut ovr: FanOverride = *self.ovr.lock().unwrap();
+        let mut ovr: FanOverride = *self.ovr.lock().unwrap_or_else(|e| e.into_inner());
 
         let (reading, nvme, nvme_model, nvme_ext, core_temps, gpu, gpu_ext, sys, chip, fans, age, last_update, targets, hist) = {
             let s = self.shared.lock().unwrap_or_else(|e| e.into_inner());
@@ -3679,14 +3678,18 @@ impl eframe::App for App {
                     match self.view {
                     View::Channels => {
                     // The rack is the whole stage here: RGB and the curve plot
+                    // Cards follow the chip, not the config: `default_with_7`
+                    // always builds 7 channels, and a 5-fan chip would other-
+                    // wise show two dead cards with no hardware behind them.
+                    let shown = self.nct.fan_count().min(cfg.channels.len());
                     // have their own tabs, so the cards get the full height and
                     // seven channels read in one glance.
                     theme::section(
                         ui,
                         "风扇通道",
-                        Some(&format!("{:02}", cfg.channels.len().min(7))),
+                        Some(&format!("{:02}", shown)),
                     );
-                    for i in 0..cfg.channels.len().min(7) {
+                    for i in 0..shown {
                         let rpm = reading.fans_rpm[i];
                         let duty = reading.controls_pct[i].unwrap_or(0.0);
                         let target = targets[i];
@@ -3755,7 +3758,7 @@ impl eframe::App for App {
                                     ui.add_space(theme::space::HALF);
                                     if editing {
                                         // inline rename: label wins over name once committed
-                                        let buf = &mut self.rename.as_mut().unwrap().1;
+                                        let buf = &mut self.rename.as_mut().expect("editing implies rename is set").1;
                                         let resp = ui.add(
                                             egui::TextEdit::singleline(buf)
                                                 .desired_width(140.0)
@@ -4303,7 +4306,7 @@ egui::CollapsingHeader::new(theme::tracked_fitted(
                 }
             }
         }
-        *self.cfg.lock().unwrap() = cfg;
+        *self.cfg.lock().unwrap_or_else(|e| e.into_inner()) = cfg;
 
         // ~30 fps while the window is visible (fan icons, duty bars and the
         // toast fade all animate); 1 fps while hidden to the tray — the

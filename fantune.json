@@ -2,26 +2,9 @@
   "interval_ms": 2000,
   "channels": [
     {
-      "enabled": true,
-      "name": "Fan #0 (机箱/冷排A)",
-      "label": "机箱扇",
-      "mode": "Curve",
-      "manual_duty": 50.0,
-      "source": "nvme:0",
-      "points": [[42.0, 45.0], [62.0, 90.0]]
-    },
-    {
-      "enabled": true,
-      "name": "Fan #1 (280冷排主力)",
-      "label": "280冷排",
-      "mode": "Curve",
-      "manual_duty": 60.0,
-      "source": "nvme:0",
-      "points": [[40.0, 60.0], [65.0, 95.0]]
-    },
-    {
       "enabled": false,
-      "name": "Fan #2 (空)",
+      "name": "Fan #0",
+      "label": "",
       "mode": "Auto",
       "manual_duty": 50.0,
       "source": "nct:PECI_0 (CPU)",
@@ -29,7 +12,8 @@
     },
     {
       "enabled": false,
-      "name": "Fan #3 (空)",
+      "name": "Fan #1",
+      "label": "",
       "mode": "Auto",
       "manual_duty": 50.0,
       "source": "nct:PECI_0 (CPU)",
@@ -37,7 +21,8 @@
     },
     {
       "enabled": false,
-      "name": "Fan #4 (空)",
+      "name": "Fan #2",
+      "label": "",
       "mode": "Auto",
       "manual_duty": 50.0,
       "source": "nct:PECI_0 (CPU)",
@@ -45,8 +30,26 @@
     },
     {
       "enabled": false,
-      "name": "Fan #5 (水泵-勿动)",
-      "label": "水泵",
+      "name": "Fan #3",
+      "label": "",
+      "mode": "Auto",
+      "manual_duty": 50.0,
+      "source": "nct:PECI_0 (CPU)",
+      "points": [[40.0, 40.0], [70.0, 100.0]]
+    },
+    {
+      "enabled": false,
+      "name": "Fan #4",
+      "label": "",
+      "mode": "Auto",
+      "manual_duty": 50.0,
+      "source": "nct:PECI_0 (CPU)",
+      "points": [[40.0, 40.0], [70.0, 100.0]]
+    },
+    {
+      "enabled": false,
+      "name": "Fan #5",
+      "label": "",
       "mode": "Auto",
       "manual_duty": 100.0,
       "source": "nct:PECI_0 (CPU)",
@@ -54,7 +57,8 @@
     },
     {
       "enabled": false,
-      "name": "Fan #6 (空)",
+      "name": "Fan #6",
+      "label": "",
       "mode": "Auto",
       "manual_duty": 50.0,
       "source": "nct:PECI_0 (CPU)",

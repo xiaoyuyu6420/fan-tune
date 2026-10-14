@@ -392,8 +392,13 @@ mod tests {
         assert_eq!(cfg.server_guard_c, 85.0);
     }
 
-    /// The shipped fantune.json must stay valid JSON, keep channel 0/1/5 labels
-    /// and remain loadable by pre-label code (serde ignores unknown fields).
+    /// The shipped fantune.json is the machine-neutral default: every channel
+    /// Auto and disabled, so a first run writes nothing at all. Someone else's
+    /// curves and `nvme:N` indices must never ship as the default — a drive
+    /// index that means one thing here means another on a different machine.
+    ///
+    /// It must also stay loadable by pre-label code (serde ignores unknown
+    /// fields), and the labelled example must keep its labels.
     #[test]
     fn repo_config_keeps_labels_and_loads_as_legacy() {
         #[derive(Deserialize)]
@@ -414,15 +419,27 @@ mod tests {
             .expect("repo fantune.json readable");
         let cfg: AppConfig = serde_json::from_str(&raw).expect("repo fantune.json parses");
         assert_eq!(cfg.channels.len(), 7);
-        assert_eq!(cfg.channels[0].label, "机箱扇");
-        assert_eq!(cfg.channels[1].label, "280冷排");
-        assert_eq!(cfg.channels[5].label, "水泵");
-        assert!(cfg.channels[2].label.is_empty());
-        assert!(cfg.channels[4].label.is_empty());
+        // safe by default: nothing is driven until the user asks for it
+        assert!(
+            cfg.channels.iter().all(|c| !c.enabled && matches!(c.mode, FanMode::Auto)),
+            "the shipped config must not drive fans on someone else's machine"
+        );
         // old code (no label/algorithm fields) still reads it
         let legacy: LegacyConfig =
             serde_json::from_str(&raw).expect("unknown fields are tolerated");
         assert_eq!(legacy.channels.len(), 7);
-        assert_eq!(legacy.channels[0].source, "nvme:0");
+
+        // the labelled example keeps its labels and still parses
+        let ex = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/examples/fantune.example.json"
+        ))
+        .expect("example config readable");
+        let ex_cfg: AppConfig = serde_json::from_str(&ex).expect("example parses");
+        assert_eq!(ex_cfg.channels.len(), 7);
+        assert_eq!(ex_cfg.channels[0].label, "机箱扇");
+        assert_eq!(ex_cfg.channels[1].label, "280冷排");
+        assert_eq!(ex_cfg.channels[5].label, "水泵");
+        assert!(ex_cfg.channels[2].label.is_empty());
     }
 }

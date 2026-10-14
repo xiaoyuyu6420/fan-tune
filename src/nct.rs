@@ -262,6 +262,12 @@ pub struct Nct<D: PortIo + Clone = Driver> {
     io: std::sync::Arc<std::sync::Mutex<()>>,
     /// Boot-static routing and slow display values (see [`SlowCache`]).
     slow: std::sync::Mutex<SlowCache>,
+    /// Where this instance keeps its captured BIOS originals (see
+    /// [`Nct::originals_path`]). An instance field rather than a global so
+    /// tests can each use their own file — with one shared path, `boot_stamp()`
+    /// is constant within a run and one test's captured originals would be
+    /// picked up by the next, making the suite order-dependent.
+    originals: std::path::PathBuf,
 }
 
 /// Everything that does not need re-reading every second.
@@ -392,7 +398,7 @@ impl Nct<Driver> {
             }
             let port = if bar & 0x07 == 0x05 { bar & 0xFFF8 } else { bar };
             eprintln!("[debug] reg_port=0x{reg_port:02X} id=0x{id:02X} rev=0x{rev:02X} bar=0x{bar:04X} port=0x{port:04X}");
-            let nct = Nct { driver: driver.clone(), port, spec, initial: std::sync::Mutex::new(std::array::from_fn(|_| None)), io: std::sync::Arc::new(std::sync::Mutex::new(())), slow: Default::default() };
+            let nct = Nct { driver: driver.clone(), port, spec, initial: std::sync::Mutex::new(std::array::from_fn(|_| None)), io: std::sync::Arc::new(std::sync::Mutex::new(())), slow: Default::default(), originals: std::path::PathBuf::new() };
             let vid_hi = nct.read_reg(VENDOR_ID_HIGH);
             let vid_lo = nct.read_reg(VENDOR_ID_LOW);
             let vid = (vid_hi as u16) << 8 | vid_lo as u16;
@@ -403,7 +409,7 @@ impl Nct<Driver> {
             // BAR didn't work — try common Nuvoton EC base addresses
             eprintln!("[debug] BAR-based vendor check failed, trying common bases...");
             for try_port in [0x290u16, 0xA00, 0x800, 0x500, 0x250, 0xA20, 0x228, 0xFF00] {
-                let nct2 = Nct { driver: driver.clone(), port: try_port, spec, initial: std::sync::Mutex::new(std::array::from_fn(|_| None)), io: std::sync::Arc::new(std::sync::Mutex::new(())), slow: Default::default() };
+                let nct2 = Nct { driver: driver.clone(), port: try_port, spec, initial: std::sync::Mutex::new(std::array::from_fn(|_| None)), io: std::sync::Arc::new(std::sync::Mutex::new(())), slow: Default::default(), originals: std::path::PathBuf::new() };
                 let vid_hi = nct2.read_reg(VENDOR_ID_HIGH);
                 let vid_lo = nct2.read_reg(VENDOR_ID_LOW);
                 let vid = (vid_hi as u16) << 8 | vid_lo as u16;
@@ -416,7 +422,7 @@ impl Nct<Driver> {
             // try bar2 too
             let port2 = if bar2 & 0x07 == 0x05 { bar2 & 0xFFF8 } else { bar2 };
             if port2 != port && port2 != 0 {
-                let nct3 = Nct { driver, port: port2, spec, initial: std::sync::Mutex::new(std::array::from_fn(|_| None)), io: std::sync::Arc::new(std::sync::Mutex::new(())), slow: Default::default() };
+                let nct3 = Nct { driver, port: port2, spec, initial: std::sync::Mutex::new(std::array::from_fn(|_| None)), io: std::sync::Arc::new(std::sync::Mutex::new(())), slow: Default::default(), originals: std::path::PathBuf::new() };
                 if nct3.vendor_ok() {
                     return Ok(nct3);
                 }
@@ -709,7 +715,10 @@ impl<D: PortIo + Clone> Nct<D> {    /// Register read with a bank cache.
     /// the in-memory copy dies with the process while the chip stays in software
     /// mode, so without this file a restart (or the successor instance) could no
     /// longer hand a channel back to the BIOS.
-    fn originals_path() -> std::path::PathBuf {
+    fn originals_path(&self) -> std::path::PathBuf {
+        if !self.originals.as_os_str().is_empty() {
+            return self.originals.clone();
+        }
         std::env::current_exe()
             .ok()
             .and_then(|p| p.parent().map(|d| d.join("fan-tune-originals.json")))
@@ -719,7 +728,7 @@ impl<D: PortIo + Clone> Nct<D> {    /// Register read with a bank cache.
     /// Fill cache slots that are still empty from the sidecar. Best effort: a
     /// missing, unreadable or stale file just means "no originals known yet".
     fn load_originals(&self) {
-        let Ok(text) = std::fs::read_to_string(Self::originals_path()) else {
+        let Ok(text) = std::fs::read_to_string(self.originals_path()) else {
             return;
         };
         let Ok(saved) = serde_json::from_str::<OriginalsFile>(&text) else {
@@ -745,7 +754,7 @@ impl<D: PortIo + Clone> Nct<D> {    /// Register read with a bank cache.
             orig: g.to_vec(),
         };
         if let Ok(text) = serde_json::to_string(&file) {
-            let _ = std::fs::write(Self::originals_path(), text);
+            let _ = std::fs::write(self.originals_path(), text);
         }
     }
 }
@@ -972,6 +981,19 @@ mod hw_tests {
     /// `Nct` can only be built by `detect`, which needs a real chip. These
     /// tests go through the private constructor the same way `detect` does.
     fn nct_on(ec: FakeEc, base: u16) -> Nct<FakeEc> {
+        // Each instance gets its own sidecar, so no test can observe another's
+        // captured originals.
+        let mut n = 0u64;
+        let path = std::env::temp_dir().join(format!(
+            "fantune-originals-{}-{}.json",
+            std::process::id(),
+            {
+                static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                n
+            }
+        ));
+        let _ = std::fs::remove_file(&path);
         Nct {
             driver: ec,
             port: base,
@@ -979,6 +1001,7 @@ mod hw_tests {
             initial: std::sync::Mutex::new(std::array::from_fn(|_| None)),
             io: std::sync::Arc::new(std::sync::Mutex::new(())),
             slow: Default::default(),
+            originals: path,
         }
     }
 
@@ -1023,6 +1046,40 @@ mod hw_tests {
         assert!(nct.set_control_raw(0, 128).is_ok());
     }
 
+    /// A 5-fan chip (NCT6779D) must refuse channels 5 and 6 even though the
+    /// config always carries 7. `default_with_7` builds seven channels what-
+    /// ever the chip is, so the guard is the only thing keeping a write away
+    /// from registers that belong to another function.
+    #[test]
+    fn a_five_fan_chip_refuses_channels_5_and_6() {
+        let ec = FakeEc::new(0x290);
+        let mut nct = Nct {
+            driver: ec.clone(),
+            port: 0x290,
+            spec: &SP_6779D,
+            initial: std::sync::Mutex::new(std::array::from_fn(|_| None)),
+            io: std::sync::Arc::new(std::sync::Mutex::new(())),
+            slow: Default::default(),
+            originals: std::path::PathBuf::new(),
+        };
+        nct.originals = std::env::temp_dir().join(format!(
+            "fantune-originals-5fan-{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&nct.originals);
+        assert_eq!(SP_6779D.fans, 5);
+        assert_eq!(nct.fan_count(), 5);
+        for i in 0..5 {
+            assert!(nct.set_control_raw(i, 128).is_ok(), "channel {i} is real");
+        }
+        for i in 5..7 {
+            assert!(nct.set_control_raw(i, 128).is_err(), "channel {i} has no hardware");
+            assert!(!nct.restore_auto(i), "nothing to hand back on channel {i}");
+        }
+        // and the registers behind the phantom channels were never touched
+        assert_eq!(ec.get(FAM_MODE[5]), 0);
+        assert_eq!(ec.get(FAM_CMD[6]), 0);
+    }
     /// Taking over a channel and handing it back must leave the registers
     /// exactly as the BIOS had them — this is the "don't leave the chip in
     /// software mode" promise the README makes.
