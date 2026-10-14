@@ -13,9 +13,10 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::algo::{Engine, SAFE_DUTY, SOURCE_FAIL_LIMIT};
+use crate::algo::Engine;
 use crate::config::{eval_curve, AppConfig, FanChannelConfig, FanMode, FanProfile, SourceCombine};
-use crate::nct::{Nct, NctReading};
+use crate::control::{ControlPass, PassInput, QUIET_DUTY};
+use crate::nct::{Nct, NctReading, FAN_COUNT};
 use crate::nvme;
 use fan_tune::rgb::{self, Diffusion, RgbEngine, RgbProfile, Shape, Strategy};
 
@@ -738,14 +739,9 @@ fn start_daemon_fallback() -> bool {
 
 // ---------- in-GUI control loop (the daemon's logic, ported) ----------
 
-/// A reading older than this must not be trusted: the sensor thread feeds the
-/// control loop from a 1s poll that can wedge on an external tool (`smartctl`
-/// without a timeout). Following a frozen temperature is worse than admitting
-/// the source is dead, so this counts as a source failure.
-const STALE_DATA_MS: u128 = 6000;
-
 /// Resolve a temperature-source key ("nct:NAME" / "nvme:IDX" / "gpu:0")
-/// against the poller thread's cached readings.
+/// against the poller thread's cached readings. Used by the panels; the
+/// control loop resolves through [`crate::control`].
 fn resolve_key(
     key: &str,
     temps: &[(String, f32)],
@@ -951,179 +947,54 @@ fn control_loop(
     ovr: Arc<Mutex<FanOverride>>,
     pulse: Arc<Mutex<Option<(usize, Instant)>>>,
 ) {
-    let mut source_fail: u32 = 0;
-    let mut safe_logged = false;
-    // one persistent ChannelState per channel: hysteresis / ramp / spin-up
-    let mut engine = Engine::new(7);
-    // server-profile thermal guard (per-channel latch)
-    let mut guard = crate::algo::ServerGuard::default();
+    let mut pass = ControlPass::new(FAN_COUNT);
+    let glogf = |msg: &str| glog(msg);
     loop {
         let interval_ms = cfg.lock().map(|c| c.interval_ms.max(500)).unwrap_or(2000);
-        let pass = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let (temps, nvme, gpu_t, has_data, stale) = match shared.lock() {
+        // one control pass; a panic here must not kill the only controller
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let (temps, nvme, gpu_t, has_data, age_ms) = match shared.lock() {
                 Ok(s) => (
                     s.reading.temps.clone(),
                     s.nvme.clone(),
                     s.gpu.map(|(t, _)| t),
                     s.has_reading,
-                    s.last_update.elapsed().as_millis() >= STALE_DATA_MS,
+                    s.last_update.elapsed().as_millis(),
                 ),
                 // poisoned lock: treat it as a dead source, not as "fine"
-                Err(_) => (vec![], vec![], None, true, true),
+                Err(_) => (vec![], vec![], None, true, u128::from(u32::MAX)),
             };
-            if !has_data {
-                return 0u32; // poller still warming up — nothing to judge yet
-            }
-            // A reading that exists but is empty or too old IS a failure. The
-            // old early-return here left `source_fail` pinned at 0, so a wedged
-            // sensor thread could hold the fans on a frozen temperature for
-            // ever without the safe-duty fallback ever engaging.
-            if temps.is_empty() || stale {
-                return 1u32;
-            }
             let cfg_snap = cfg.lock().map(|c| c.clone()).unwrap_or_default();
             let ov = ovr.lock().map(|o| *o).unwrap_or(FanOverride::None);
             let now = Instant::now();
 
-            // Identification pulse (识别 button): hold one channel at 100% for a
-            // few seconds so the user can hear/see which physical fan it is.
-            // It outranks the overlay — it was asked for explicitly.
-            let mut pulse_over = None;
-            if let Some((ch, until)) = *pulse.lock().unwrap_or_else(|e| e.into_inner()) {
-                if now < until && ch < nct.fan_count() {
-                    let _ = nct.set_duty_pct(ch, 100.0);
-                    engine.note_write(ch, 100.0, now);
-                    let mut t: [Option<f32>; 7] = [None; 7];
-                    t[ch] = Some(100.0);
-                    publish_targets(&shared, t);
-                    return 0u32;
-                }
-                pulse_over = Some(ch);
-            }
-            if let Some(ch) = pulse_over {
+            let out = pass.run(
+                &nct,
+                &cfg_snap,
+                PassInput {
+                    temps: &temps,
+                    nvme: &nvme,
+                    gpu: gpu_t,
+                    data_age_ms: Some(age_ms),
+                    overlay: match ov {
+                        FanOverride::Full => Some(100.0),
+                        FanOverride::Quiet => Some(QUIET_DUTY),
+                        FanOverride::None => None,
+                    },
+                    pulse: *pulse.lock().unwrap_or_else(|e| e.into_inner()),
+                    has_data,
+                },
+                now,
+                &glogf,
+            );
+            if out.pulse_expired {
                 *pulse.lock().unwrap_or_else(|e| e.into_inner()) = None;
-                // A channel we are not supposed to drive must not be left in
-                // software mode by the pulse: hand it straight back to the BIOS.
-                if cfg_snap.channels.get(ch).map_or(false, |c| !c.managed()) {
-                    nct.restore_auto(ch);
-                }
             }
-            match ov {
-                FanOverride::Full | FanOverride::Quiet => {
-                    let duty = if matches!(ov, FanOverride::Full) { 100.0 } else { 40.0 };
-                    let mut published: [Option<f32>; 7] = [None; 7];
-                    // Hands-off channels (pump, or `enabled: false`) are not
-                    // dragged along by a one-click override.
-                    for (i, c) in cfg_snap.channels.iter().enumerate().take(nct.fan_count()) {
-                        if c.hands_off() {
-                            continue;
-                        }
-                        let _ = nct.set_duty_pct(i, duty);
-                        engine.note_write(i, duty, now);
-                        published[i] = Some(duty);
-                    }
-                    publish_targets(&shared, published);
-                    0
-                }
-                FanOverride::None => {
-                    let resolve = |key: &str| resolve_key(key, &temps, &nvme, gpu_t);
-                    let targets = engine.targets(&cfg_snap, &resolve, now);
-                    let mut pass_fail = 0u32;
-                    let mut published: [Option<f32>; 7] = [None; 7];
-                    for (i, c) in cfg_snap.channels.iter().enumerate() {
-                        if i >= nct.fan_count() {
-                            break; // no hardware above the chip's fan count
-                        }
-                        if !c.managed() {
-                            continue; // left to the BIOS
-                        }
-                        // profile effects live inside the engine (Gaming
-                        // temp-offset, Server smoothing); the Server guard is
-                        // the one caller-side addition — it needs the temps
-                        let want: Option<f32> = match c.mode {
-                            FanMode::Manual => Some(c.manual_duty.clamp(0.0, 100.0)),
-                            FanMode::Curve | FanMode::Budget => targets.get(i).copied().flatten().map(|d| {
-                                let force = matches!(cfg_snap.profile, FanProfile::Server) && {
-                                    let hottest = crate::algo::channel_hottest(c, &resolve);
-                                    guard.forced(i, cfg_snap.server_guard_c, hottest)
-                                };
-                                if force {
-                                    100.0
-                                } else {
-                                    d
-                                }
-                            }),
-                            FanMode::Auto => None,
-                        };
-                        match want {
-                            Some(duty) => {
-                                let _ = nct.set_duty_pct(i, duty);
-                                if matches!(c.mode, FanMode::Manual) {
-                                    engine.note_write(i, duty, now);
-                                }
-                                published[i] = Some(duty);
-                            }
-                            None => {
-                                // a curve channel with no data is a real failure
-                                if matches!(c.mode, FanMode::Curve | FanMode::Budget) {
-                                    pass_fail += 1;
-                                }
-                            }
-                        }
-                    }
-                    publish_targets(&shared, published);
-                    pass_fail
-                }
-            }
+            publish_targets(&shared, out.written);
         }));
-        match pass {
-            Ok(0) => {
-                source_fail = 0;
-                safe_logged = false;
-            }
-            Ok(n) => {
-                source_fail += n;
-                if source_fail >= SOURCE_FAIL_LIMIT {
-                    // curve channels with no temperature data — blow, don't cook
-                    let cfg_snap = cfg.lock().map(|c| c.clone()).unwrap_or_default();
-                    let ov = ovr.lock().map(|o| *o).unwrap_or(FanOverride::None);
-                    if ov == FanOverride::None {
-                        let now = Instant::now();
-                        // publish what is actually written: in safe mode the
-                        // curve channels' real target IS SAFE_DUTY, not the
-                        // value the curve would have produced
-                        let mut published: [Option<f32>; 7] = shared
-                            .lock()
-                            .map(|s| s.targets)
-                            .unwrap_or([None; 7]);
-                        for (i, c) in cfg_snap.channels.iter().enumerate() {
-                            if i < nct.fan_count()
-                                && !c.hands_off()
-                                && matches!(c.mode, FanMode::Curve | FanMode::Budget)
-                            {
-                                let _ = nct.set_duty_pct(i, SAFE_DUTY);
-                                engine.note_write(i, SAFE_DUTY, now);
-                                published[i] = Some(SAFE_DUTY);
-                            }
-                        }
-                        publish_targets(&shared, published);
-                    }
-                    if !safe_logged {
-                        eprintln!(
-                            "[ctrl] temperature source failed {source_fail}x, engaging SAFE DUTY {SAFE_DUTY}%"
-                        );
-                        safe_logged = true;
-                    }
-                }
-            }
-            Err(_) => {
-                eprintln!("[ctrl] panic in control pass — recovering loop");
-            }
-        }
         std::thread::sleep(Duration::from_millis(interval_ms));
     }
 }
-
 /// Append a milestone line to fan-tune-gui.log (the GUI has no console).
 fn glog(msg: &str) {
     use std::io::Write;

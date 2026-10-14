@@ -1,12 +1,13 @@
 mod algo;
 mod config;
+mod control;
 mod cpu;
 mod driver;
 mod nct;
 mod nvme;
 mod ui;
 
-use algo::{Engine, SAFE_DUTY, SOURCE_FAIL_LIMIT};
+use control::{ControlPass, PassInput};
 use config::AppConfig;
 use nct::Nct;
 use std::sync::{Arc, Mutex};
@@ -307,46 +308,71 @@ fn cmd_daemon() {
     };
 
     // ---- nvme cache thread (smartctl is slow; keep it off the control loop) ----
+    // The caches carry the instant they were last *successfully* filled: a
+    // reader thread wedged inside smartctl leaves the previous values in
+    // place, and without a stamp the control loop cannot tell a fresh cache
+    // from a frozen one.
     let nvme_cache: Arc<Mutex<Vec<(usize, f32)>>> = Arc::new(Mutex::new(Vec::new()));
+    let nvme_stamp: Arc<Mutex<Instant>> = Arc::new(Mutex::new(Instant::now()));
     {
         let cache = nvme_cache.clone();
-        let log = Log::new("fan-tune.log");
+        let stamp = nvme_stamp.clone();
         std::thread::spawn(move || loop {
             let v = nvme::read_smart_drives();
             if let Ok(mut c) = cache.lock() {
                 *c = v;
+                if let Ok(mut s) = stamp.lock() {
+                    *s = Instant::now();
+                }
             }
             std::thread::sleep(Duration::from_secs(10));
         });
-        let _ = log;
     }
 
     // ---- gpu temp cache thread (nvidia-smi) — needed by "gpu:0" sources ----
     let gpu_cache: Arc<Mutex<Option<f32>>> = Arc::new(Mutex::new(None));
+    let gpu_stamp: Arc<Mutex<Instant>> = Arc::new(Mutex::new(Instant::now()));
     {
         let cache = gpu_cache.clone();
+        let stamp = gpu_stamp.clone();
         std::thread::spawn(move || loop {
             let t = nvme::read_gpu().map(|(t, _)| t);
             if let Ok(mut c) = cache.lock() {
                 *c = t;
+                if let Ok(mut s) = stamp.lock() {
+                    *s = Instant::now();
+                }
             }
             std::thread::sleep(Duration::from_secs(5));
         });
     }
 
+    /// Age of the newest temperature input, in milliseconds — the daemon has
+    /// no poller to borrow a clock from, so it takes the oldest of the three
+    /// producers (chip, smartctl, nvidia-smi): if any of them has stopped
+    /// delivering, the combined reading is no longer trustworthy.
+    fn data_age_ms(chip: Instant, nvme: &Mutex<Instant>, gpu: &Mutex<Instant>) -> u128 {
+        let mut age = chip.elapsed().as_millis();
+        for s in [nvme, gpu] {
+            if let Ok(t) = s.lock() {
+                age = age.max(t.elapsed().as_millis());
+            }
+        }
+        age
+    }
+
     log.info(&format!(
-        "control loop started, {} channels, interval {}ms, safe_duty={SAFE_DUTY}%",
+        "control loop started, {} channels, interval {}ms, safe_duty={}%",
         cfg.channels.len(),
-        cfg.interval_ms
+        cfg.interval_ms,
+        algo::SAFE_DUTY
     ));
 
-    let mut source_fail: u32 = 0;
-    let mut safe_mode = false;
-    // algorithm engine: persistent per-channel curve state (EMA/hysteresis/
-    // ramp/spin-up). States survive config hot reloads (indexed like channels).
-    let mut engine = Engine::new(7);
-    // server-profile thermal guard (per-channel latch)
-    let mut guard = algo::ServerGuard::default();
+    // Stamp of the last successful chip read — the daemon reads the chip
+    // inline, so it is updated in the loop below.
+    let chip_stamp: Arc<Mutex<Instant>> = Arc::new(Mutex::new(Instant::now()));
+    let mut pass = ControlPass::new(cfg.channels.len());
+    let logf = |msg: &str| log.info(msg);
 
     loop {
         // graceful handover: GUI takeover writes a sentinel; exit cleanly so
@@ -358,111 +384,34 @@ fn cmd_daemon() {
             return;
         }
         // one control pass; a panic here must not kill the daemon
-        let pass = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             // temperatures only: the control loop needs nothing else, and this
             // skips most of the chip's register traffic every tick
             let temps = nct.read_temps();
+            if let Ok(mut s) = chip_stamp.lock() { *s = Instant::now(); }
             let nvme_temps = nvme_cache.lock().map(|c| c.clone()).unwrap_or_default();
             let gpu_t = gpu_cache.lock().ok().and_then(|c| *c);
-
-            let resolve = |key: &str| -> Option<f32> {
-                if key.starts_with("gpu") {
-                    return gpu_t;
-                }
-                if let Some(idx) = key.strip_prefix("nvme:") {
-                    let i: usize = idx.parse().ok()?;
-                    return nvme_temps.iter().find(|(n, _)| *n == i).map(|(_, t)| *t);
-                }
-                if let Some(name) = key.strip_prefix("nct:") {
-                    return temps.iter().find(|(n, _)| n == name).map(|(_, t)| *t);
-                }
-                None
-            };
+            // The chip read is the only producer with a clock of its own here;
+            // the two caches are stamped by their threads (see above), and the
+            // oldest producer decides whether the reading is still fresh.
+            let age = data_age_ms(chip_stamp.lock().ok().map(|s| *s).unwrap_or_else(Instant::now), &nvme_stamp, &gpu_stamp);
             let now = Instant::now();
-            let targets = engine.targets(&cfg, &resolve, now);
-
-            let mut pass_fail = 0u32;
-            for (i, c) in cfg.channels.iter().enumerate() {
-                if i >= nct.fan_count() {
-                    break; // channels above the chip's fan count have no hardware
-                }
-                // `enabled: false` = leave the channel to the BIOS entirely
-                if !c.managed() {
-                    continue;
-                }
-                // profile effects live inside the engine (Gaming temp-offset,
-                // Server smoothing); the Server guard is the caller-side bit
-                let want: Option<f32> = match c.mode {
-                    config::FanMode::Manual => Some(c.manual_duty.clamp(0.0, 100.0)),
-                    config::FanMode::Curve | config::FanMode::Budget => {
-                        targets.get(i).copied().flatten().map(|d| {
-                            let force = matches!(cfg.profile, config::FanProfile::Server) && {
-                                let hottest = algo::channel_hottest(c, &resolve);
-                                guard.forced(i, cfg.server_guard_c, hottest)
-                            };
-                            if force {
-                                100.0
-                            } else {
-                                d
-                            }
-                        })
-                    }
-                    config::FanMode::Auto => None,
-                };
-                match want {
-                    Some(duty) => {
-                        let _ = nct.set_duty_pct(i, duty);
-                        if matches!(c.mode, config::FanMode::Manual) {
-                            engine.note_write(i, duty, now);
-                        }
-                    }
-                    None => {
-                        // a curve/budget channel with no data is a real failure
-                        if matches!(
-                            c.mode,
-                            config::FanMode::Curve | config::FanMode::Budget
-                        ) {
-                            pass_fail += 1;
-                        }
-                    }
-                }
-            }
-            pass_fail
+            pass.run(
+                &nct,
+                &cfg,
+                PassInput {
+                    temps: &temps,
+                    nvme: &nvme_temps,
+                    gpu: gpu_t,
+                    data_age_ms: Some(age),
+                    overlay: None,
+                    pulse: None,
+                    has_data: true,
+                },
+                now,
+                &logf,
+            );
         }));
-
-        match pass {
-            Ok(0) => {
-                if safe_mode {
-                    log.info("temperature sources recovered, exiting safe mode");
-                }
-                source_fail = 0;
-                safe_mode = false;
-            }
-            Ok(n) => {
-                source_fail += n;
-                if source_fail >= SOURCE_FAIL_LIMIT && !safe_mode {
-                    safe_mode = true;
-                    log.err(&format!(
-                        "temperature source failed {source_fail}x, engaging SAFE DUTY {SAFE_DUTY}% on all curve channels"
-                    ));
-                }
-                if safe_mode {
-                    let now = Instant::now();
-                    for (i, c) in cfg.channels.iter().enumerate() {
-                        if i < nct.fan_count()
-                            && !c.hands_off()
-                            && matches!(c.mode, config::FanMode::Curve | config::FanMode::Budget)
-                        {
-                            let _ = nct.set_duty_pct(i, SAFE_DUTY);
-                            engine.note_write(i, SAFE_DUTY, now);
-                        }
-                    }
-                }
-            }
-            Err(_) => {
-                log.err("panic in control pass — recovering loop");
-            }
-        }
 
         // config hot reload
         if let Ok(m) = std::fs::metadata(&config_path).and_then(|m| m.modified()) {
@@ -480,7 +429,6 @@ fn cmd_daemon() {
         std::thread::sleep(Duration::from_millis(cfg.interval_ms.max(500)));
     }
 }
-
 fn cmd_install_task() {
     let exe = std::env::current_exe().unwrap();
     let workdir = exe.parent().unwrap().to_path_buf();
