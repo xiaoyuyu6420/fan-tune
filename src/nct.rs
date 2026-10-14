@@ -228,8 +228,28 @@ fn source_name(v: u8) -> Option<&'static str> {
     })
 }
 
-pub struct Nct {
-    driver: Driver,
+/// Raw ISA port access — the only thing `Nct` needs from ring 0.
+///
+/// `driver::Driver` implements this on real hardware (through WinRing0 or
+/// PawnIO). Tests implement it over a 256-byte-per-bank array, which is what
+/// finally makes the register logic testable: before this, `Nct` held a
+/// concrete `Driver`, so nothing below `detect()` could be exercised without
+/// a kernel driver and administrator rights.
+pub trait PortIo {
+    fn read_io_port(&self, port: u16) -> u8;
+    fn write_io_port(&self, port: u16, value: u8);
+}
+
+impl PortIo for Driver {
+    fn read_io_port(&self, port: u16) -> u8 {
+        Driver::read_io_port(self, port)
+    }
+    fn write_io_port(&self, port: u16, value: u8) {
+        Driver::write_io_port(self, port, value)
+    }
+}
+pub struct Nct<D: PortIo + Clone = Driver> {
+    driver: D,
     /// EC base address (e.g. 0x290); index = base+5, data = base+6
     port: u16,
     /// Register map of the chip that answered detection.
@@ -280,12 +300,12 @@ pub struct NctReading {
     pub detailed_temps: Vec<TempReading>,
 }
 
-impl Nct {
+impl Nct<Driver> {
     /// Probe both LPC entry ports (0x2E primary, 0x4E secondary) for a Nuvoton
     /// SuperIO chip we have a register map for, and return the configured
     /// instance. A chip we recognise but cannot drive is reported by name and
     /// reason instead of being poked with the wrong registers.
-    pub fn detect(driver: Driver) -> Result<Nct, String> {
+    pub fn detect(driver: Driver) -> Result<Nct<Driver>, String> {
         let mut seen: Vec<String> = Vec::new();
         for reg_port in [0x2Eu16, 0x4E] {
             let driver = driver.clone();
@@ -412,7 +432,9 @@ impl Nct {
         ))
     }
 
-    /// Register read with a bank cache.
+}
+
+impl<D: PortIo + Clone> Nct<D> {    /// Register read with a bank cache.
     ///
     /// Selecting the bank is half of what one register costs, so callers that
     /// touch many registers keep a cache and walk their accesses in bank order
@@ -618,7 +640,7 @@ impl Nct {
     /// A second handle to the same kernel driver. `detect` consumes the caller's
     /// `Driver`; readers that are not SuperIO transactions (e.g.
     /// `cpu::read_core_temps`) need one of their own.
-    pub fn driver(&self) -> Driver {
+    pub fn driver(&self) -> D {
         self.driver.clone()
     }
 
@@ -859,5 +881,177 @@ mod tests {
         // nothing at all
         assert!(lookup_chip(0x00, 0x00).is_none());
         assert!(lookup_chip(0xFF, 0xFF).is_none());
+    }
+}
+
+#[cfg(test)]
+mod hw_tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::{Arc, Mutex};
+
+    /// A simulated NCT6796D-R EC space: 16 banks of 256 bytes, reached
+    /// through the index/data port pair exactly like the real chip.
+    ///
+    /// This is what `PortIo` bought: the bank cache, the BIOS hand-back and
+    /// the out-of-range guard can now be exercised without a kernel driver.
+    struct FakeEc {
+        banks: Arc<Mutex<HashMap<u8, [u8; 256]>>>,
+        cur_bank: Arc<Mutex<Option<u8>>>,
+        idx_reg: Arc<Mutex<u8>>,
+        /// counts every real port operation, so a cache regression shows up
+        /// as a number, not as a guess
+        ops: Arc<AtomicUsize>,
+        base: u16,
+    }
+
+    impl FakeEc {
+        fn new(base: u16) -> Self {
+            FakeEc {
+                banks: Arc::new(Mutex::new(HashMap::new())),
+                cur_bank: Arc::new(Mutex::new(None)),
+                idx_reg: Arc::new(Mutex::new(0)),
+                ops: Arc::new(AtomicUsize::new(0)),
+                base,
+            }
+        }
+        fn set(&self, addr: u16, v: u8) {
+            let mut b = self.banks.lock().unwrap();
+            b.entry((addr >> 8) as u8).or_insert([0; 256])[(addr & 0xFF) as usize] = v;
+        }
+        fn get(&self, addr: u16) -> u8 {
+            let b = self.banks.lock().unwrap();
+            b.get(&((addr >> 8) as u8))
+                .map(|p| p[(addr & 0xFF) as usize])
+                .unwrap_or(0)
+        }
+    }
+
+    impl Clone for FakeEc {
+        fn clone(&self) -> Self {
+            FakeEc {
+                banks: self.banks.clone(),
+                cur_bank: self.cur_bank.clone(),
+                idx_reg: self.idx_reg.clone(),
+                ops: self.ops.clone(),
+                base: self.base,
+            }
+        }
+    }
+
+    impl PortIo for FakeEc {
+        fn read_io_port(&self, port: u16) -> u8 {
+            self.ops.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if port == self.base + 6 {
+                let bank = *self.cur_bank.lock().unwrap();
+                let idx = *self.idx_reg.lock().unwrap();
+                let b = self.banks.lock().unwrap();
+                b.get(&bank.unwrap_or(0)).map(|p| p[idx as usize]).unwrap_or(0)
+            } else {
+                0
+            }
+        }
+        fn write_io_port(&self, port: u16, value: u8) {
+            self.ops.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if port == self.base + 5 {
+                *self.idx_reg.lock().unwrap() = value;
+            } else if port == self.base + 6 {
+                let idx = *self.idx_reg.lock().unwrap();
+                if idx == 0x4E {
+                    *self.cur_bank.lock().unwrap() = Some(value);
+                } else {
+                    let bank = *self.cur_bank.lock().unwrap();
+                    let mut b = self.banks.lock().unwrap();
+                    b.entry(bank.unwrap_or(0)).or_insert([0; 256])[idx as usize] = value;
+                }
+            }
+        }
+    }
+
+    /// `Nct` can only be built by `detect`, which needs a real chip. These
+    /// tests go through the private constructor the same way `detect` does.
+    fn nct_on(ec: FakeEc, base: u16) -> Nct<FakeEc> {
+        Nct {
+            driver: ec,
+            port: base,
+            spec: &SP_6796DR,
+            initial: std::sync::Mutex::new(std::array::from_fn(|_| None)),
+            io: std::sync::Arc::new(std::sync::Mutex::new(())),
+            slow: Default::default(),
+        }
+    }
+
+    /// The bank cache is the single biggest port-traffic saving in the file.
+    /// Two registers in the same bank must cost one bank switch, not two.
+    #[test]
+    fn consecutive_reads_in_one_bank_switch_the_bank_once() {
+        let ec = FakeEc::new(0x290);
+        ec.set(0x073, 60);
+        ec.set(0x075, 70);
+        let nct = nct_on(ec.clone(), 0x290);
+        let ops_before = ec.ops.load(std::sync::atomic::Ordering::Relaxed);
+        let mut bank = None;
+        let a = nct.read_reg_cached(0x073, &mut bank);
+        let b = nct.read_reg_cached(0x075, &mut bank);
+        assert_eq!((a, b), (60, 70), "both registers must read back");
+        // 2 reads x (idx + data) + 1 bank select (idx + data) = 6
+        let used = ec.ops.load(std::sync::atomic::Ordering::Relaxed) - ops_before;
+        assert_eq!(used, 6, "one bank switch for two reads in the same bank: {used}");
+    }
+
+    /// Crossing a bank must switch it again — the cache must not lie.
+    #[test]
+    fn crossing_banks_switches_again() {
+        let ec = FakeEc::new(0x290);
+        ec.set(0x073, 60); // bank 0
+        ec.set(0x4B0, 12); // bank 4
+        let nct = nct_on(ec.clone(), 0x290);
+        let mut bank = None;
+        assert_eq!(nct.read_reg_cached(0x073, &mut bank), 60);
+        assert_eq!(nct.read_reg_cached(0x4B0, &mut bank), 12);
+    }
+
+    /// The safety property that matters most: a channel above the chip's fan
+    /// count must be refused, because those registers belong to something else.
+    #[test]
+    fn writes_above_the_fan_count_are_refused() {
+        let ec = FakeEc::new(0x290);
+        let nct = nct_on(ec, 0x290);
+        assert_eq!(SP_6796DR.fans, 7);
+        assert!(nct.set_control_raw(7, 128).is_err());
+        assert!(nct.set_control_raw(0, 128).is_ok());
+    }
+
+    /// Taking over a channel and handing it back must leave the registers
+    /// exactly as the BIOS had them — this is the "don't leave the chip in
+    /// software mode" promise the README makes.
+    #[test]
+    fn restore_auto_writes_back_the_captured_registers() {
+        let ec = FakeEc::new(0x290);
+        // BIOS state: mode register = 0x81 (automatic), duty = 0x33
+        ec.set(FAM_MODE[0], 0x81);
+        ec.set(FAM_CMD[0], 0x33);
+        let nct = nct_on(ec.clone(), 0x290);
+        assert!(nct.set_control_raw(0, 200).is_ok());
+        // software mode + our duty
+        assert_eq!(ec.get(FAM_MODE[0]), 0);
+        assert_eq!(ec.get(FAM_CMD[0]), 200);
+        assert!(nct.restore_auto(0));
+        assert_eq!(ec.get(FAM_MODE[0]), 0x81, "BIOS mode restored");
+        assert_eq!(ec.get(FAM_CMD[0]), 0x33, "BIOS duty restored");
+    }
+
+    /// Handing back a channel we never touched must be a no-op, not a write
+    /// of zeros into the control registers.
+    #[test]
+    fn restore_auto_on_an_untouched_channel_does_nothing() {
+        let ec = FakeEc::new(0x290);
+        ec.set(FAM_MODE[0], 0x81);
+        ec.set(FAM_CMD[0], 0x33);
+        let nct = nct_on(ec.clone(), 0x290);
+        assert!(!nct.restore_auto(0));
+        assert_eq!(ec.get(FAM_MODE[0]), 0x81);
+        assert_eq!(ec.get(FAM_CMD[0]), 0x33);
     }
 }

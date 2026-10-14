@@ -9,6 +9,7 @@ mod ui;
 
 use control::{ControlPass, PassInput};
 use config::AppConfig;
+use driver::Driver;
 use nct::Nct;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -87,7 +88,7 @@ fn main() {
     }
 }
 
-fn open_nct() -> Nct {
+fn open_nct() -> Nct<Driver> {
     // CLI paths honour the same backend preference as the GUI/daemon
     let pref = config::AppConfig::load().0.backend;
     let driver = driver::Driver::install_and_open(pref).expect("driver open failed (admin required)");

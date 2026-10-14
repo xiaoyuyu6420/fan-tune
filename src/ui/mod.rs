@@ -265,6 +265,9 @@ fn ram_info() -> Option<(f32, f32, f32)> {
 /// System stats poller thread (CPU load + RAM + per-core temps), ~2s cadence.
 /// Also the single producer of the history ring buffer. GPU stats come from the
 /// sensor thread's cache — this loop must not spawn nvidia-smi of its own.
+/// Monotonic origin for the sensor poller's slow-refresh schedule. Wall-clock
+/// time can step backwards (NTP, resume from suspend); this cannot.
+static POLL_START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
 fn sys_poller(shared: Arc<Mutex<Shared>>, driver: crate::driver::Driver) {
     loop {
         let cpu = cpu_usage();
@@ -1033,6 +1036,10 @@ fn rgb_yield_sentinel_path() -> std::path::PathBuf {
 }
 
 pub fn run(minimized: bool) -> Result<(), String> {
+    // The poller's slow-refresh schedule is measured from here (see
+    // `POLL_START`): a monotonic origin cannot be stepped backwards by NTP or
+    // by a suspend/resume cycle.
+    let _ = POLL_START.set(Instant::now());
     let singleton = match ensure_single_instance() {
         Some(h) => h,
         None => {
@@ -1150,7 +1157,7 @@ pub fn run(minimized: bool) -> Result<(), String> {
     glog("takeover done");
     eprintln!("[takeover] GUI is now the single fan controller");
 
-    let nct = match Nct::detect(driver) {
+    let nct: Arc<Nct<crate::driver::Driver>> = match Nct::detect(driver) {
         Ok(n) => Arc::new(n),
         Err(e) => {
             glog(&format!("chip detection failed: {e}"));
@@ -1214,10 +1221,14 @@ pub fn run(minimized: bool) -> Result<(), String> {
             // Refresh slot, computed before the chip read so the slow blocks
             // (voltages, smartctl, nvidia-smi) share one schedule: a full chip
             // read every second, the slow parts once per 10s.
-            let cycle = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as u32 / 10_000)
-                .unwrap_or(0);
+            //
+            // Measured from a monotonic clock captured once at startup. This
+            // used to be `SystemTime`, which NTP and suspend/resume can move
+            // backwards; a backward step changes the slot number and fires a
+            // full smartctl sweep (3 drives x ~230 ms) on a tick that was
+            // supposed to be cheap — and the `unwrap_or(0)` fallback made a
+            // clock failure do the same.
+            let cycle = (POLL_START.get_or_init(Instant::now).elapsed().as_secs() / 10) as u32;
             let slow = LAST.with(|c| c.borrow().cycle != cycle);
             let r = nct.read_all(slow);
             // one full smartctl pass per drive per 10s slot, reused in between
