@@ -60,7 +60,6 @@ const FILE_READ_ACCESS: u32 = 1;
 const FILE_WRITE_ACCESS: u32 = 2;
 
 pub const IOCTL_READ_MSR: u32 = ctl_code(OLS_TYPE, 0x821, FILE_ANY_ACCESS);
-pub const IOCTL_WRITE_MSR: u32 = ctl_code(OLS_TYPE, 0x822, FILE_ANY_ACCESS);
 pub const IOCTL_READ_IO_PORT_BYTE: u32 = ctl_code(OLS_TYPE, 0x833, FILE_READ_ACCESS);
 pub const IOCTL_WRITE_IO_PORT_BYTE: u32 = ctl_code(OLS_TYPE, 0x836, FILE_WRITE_ACCESS);
 
@@ -517,11 +516,6 @@ impl Driver {
         }
     }
 
-    /// Which ring-0 path this handle is using (logged at bring-up).
-    pub fn backend(&self) -> Backend {
-        self.backend
-    }
-
     /// Tell the PawnIO LpcIO module which SuperIO config port pair we are
     /// talking to: slot 0 = 0x2E/0x2F, slot 1 = 0x4E/0x4F. Must be called
     /// before that port's config-mode entry, and it *resets* the module
@@ -708,7 +702,7 @@ fn ensure_service(service_name: &str) -> Result<(), String> {
             return Err(format!("OpenSCManager failed, err={}", last_error()));
         }
         let name_w = to_wide(service_name);
-        let mut service = OpenServiceW(manager, name_w.as_ptr(), SERVICE_ALL_ACCESS);
+        let service = OpenServiceW(manager, name_w.as_ptr(), SERVICE_ALL_ACCESS);
         if service.is_null() {
             // create it, pointing at the driver file next to our exe
             let exe = std::env::current_exe().map_err(|e| e.to_string())?;

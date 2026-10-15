@@ -783,8 +783,6 @@ fn boot_stamp() -> u64 {
         .unwrap_or(0)
 }
 
-pub const FAN_COUNT_PUB: usize = FAN_COUNT;
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1015,14 +1013,13 @@ mod hw_tests {
     fn nct_on(ec: FakeEc, base: u16) -> Nct<FakeEc> {
         // Each instance gets its own sidecar, so no test can observe another's
         // captured originals.
-        let mut n = 0u64;
         let path = std::env::temp_dir().join(format!(
             "fantune-originals-{}-{}.json",
             std::process::id(),
+            // One number per instance, drawn from a process-wide sequence.
             {
                 static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                n
+                SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             }
         ));
         let _ = std::fs::remove_file(&path);

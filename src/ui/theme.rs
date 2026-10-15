@@ -96,10 +96,6 @@ impl Tokens {
             self.fg_soft
         }
     }
-
-    pub fn hover_lift(&self) -> Color32 {
-        self.case_hi
-    }
 }
 
 // --- the ten palettes (RhinE tokens.json, verbatim) ------------------------
@@ -204,6 +200,10 @@ pub struct Scheme {
     pub id: &'static str,
     pub label: &'static str,
     pub dark: Tokens,
+    /// The light half of the scheme. Kept as part of the record even though
+    /// the flat [`ALL`] array is what the palette lookup reads: deleting
+    /// it would silently drop the light palettes from `theme_ids()`.
+    #[allow(dead_code)]
     pub light: Tokens,
 }
 
@@ -245,6 +245,11 @@ pub fn id_of(index: usize) -> String {
 }
 
 /// Every `(id, label)` the UI can offer, e.g. `("archive-dark", "ARCHIVE DARK")`.
+///
+/// The in-panel picker builds its own list from [`SCHEMES`] (it has to know
+/// the current light/dark mode), so this is the reference list — used by the
+/// tests as the contract for what must round-trip.
+#[cfg(test)]
 pub fn theme_ids() -> Vec<(String, String)> {
     let mut v = Vec::with_capacity(10);
     for (i, s) in SCHEMES.iter().enumerate() {
@@ -300,6 +305,10 @@ pub fn grain_on() -> bool {
 // ------------------------------------------------------------------ scale ---
 
 /// Type scale. Seven steps, deliberately few.
+///
+/// Not every step has a call site at any moment — the scale is a vocabulary,
+/// not a list of what happens to be used today.
+#[allow(dead_code)]
 pub mod size {
     /// wide-tracked uppercase micro label
     pub const MICRO: f32 = 11.0;
@@ -318,6 +327,9 @@ pub mod size {
 }
 
 /// Spacing. An 8 dp module, 24 dp page gutter — RhinE's own numbers.
+///
+/// Same deal as [`size`]: the scale is the contract, call sites come and go.
+#[allow(dead_code)]
 pub mod space {
     pub const GUTTER: f32 = 24.0;
     pub const COL: f32 = 16.0;
@@ -337,6 +349,7 @@ pub mod space {
 
 /// Extra letter spacing, in pixels. RhinE works in em; these are the em values
 /// pre-multiplied at the sizes above, which is easier to reason about in egui.
+#[allow(dead_code)]
 pub mod track {
     pub const MICRO: f32 = 1.2;
     pub const LABEL: f32 = 1.3;
@@ -484,33 +497,33 @@ pub fn install_style(ctx: &egui::Context) {
     v.widgets.noninteractive.bg_fill = tk.panel;
     v.widgets.noninteractive.weak_bg_fill = tk.panel;
     v.widgets.noninteractive.bg_stroke = Stroke::new(space::HAIR, tk.hair);
-    v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, tk.fg_soft);
+    v.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, tk.fg_soft);
 
     v.widgets.inactive.bg_fill = tk.case;
     v.widgets.inactive.weak_bg_fill = tk.case;
     v.widgets.inactive.bg_stroke = Stroke::new(space::HAIR, tk.hair);
-    v.widgets.inactive.fg_stroke = Stroke::new(1.0, tk.fg);
+    v.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, tk.fg);
 
     v.widgets.hovered.bg_fill = tk.case_hi;
     v.widgets.hovered.weak_bg_fill = tk.case_hi;
     v.widgets.hovered.bg_stroke = Stroke::new(space::HAIR, tk.accent);
-    v.widgets.hovered.fg_stroke = Stroke::new(1.0, tk.fg);
+    v.widgets.hovered.fg_stroke = Stroke::new(1.0_f32, tk.fg);
 
     // Pressed = inverted block. The stamp of this design language.
     v.widgets.active.bg_fill = tk.fg;
     v.widgets.active.weak_bg_fill = tk.fg;
     v.widgets.active.bg_stroke = Stroke::new(space::HAIR, tk.fg);
-    v.widgets.active.fg_stroke = Stroke::new(1.0, tk.bg);
+    v.widgets.active.fg_stroke = Stroke::new(1.0_f32, tk.bg);
 
     v.widgets.open.bg_fill = tk.panel_hi;
     v.widgets.open.weak_bg_fill = tk.panel_hi;
     v.widgets.open.bg_stroke = Stroke::new(space::HAIR, tk.hair);
-    v.widgets.open.fg_stroke = Stroke::new(1.0, tk.fg);
+    v.widgets.open.fg_stroke = Stroke::new(1.0_f32, tk.fg);
 
     // Selected = inverted block. `selection.stroke.color` is also the text
     // colour egui uses on top of `selection.bg_fill`, hence the swap.
     v.selection.bg_fill = tk.fg;
-    v.selection.stroke = Stroke::new(1.0, tk.bg);
+    v.selection.stroke = Stroke::new(1.0_f32, tk.bg);
 
     for w in [
         &mut v.widgets.noninteractive,
@@ -863,12 +876,12 @@ pub fn reactor(p: &egui::Painter, center: Pos2, r: f32, heat: f32, phase: f32) {
     let sweep = 1.5 * std::f32::consts::PI * heat;
     if sweep > 0.03 {
         let col = if heat >= 0.80 { tk.hot } else { tk.accent };
-        arc_line(p, center, r * 0.80, start, start + sweep, Stroke::new(2.5, col));
+        arc_line(p, center, r * 0.80, start, start + sweep, Stroke::new(2.5_f32, col));
     }
     // three turbine blades, rotating
     for k in 0..3 {
         let a0 = phase + k as f32 * std::f32::consts::TAU / 3.0;
-        arc_line(p, center, r * 0.40, a0, a0 + 0.55, Stroke::new(1.5, tk.mark));
+        arc_line(p, center, r * 0.40, a0, a0 + 0.55, Stroke::new(1.5_f32, tk.mark));
     }
     p.circle_filled(center, 1.6, tk.fg);
 }
@@ -1068,6 +1081,11 @@ pub fn spark(
 
 /// A horizontal gauge: inset track, flat fill, optional target tick and ruler.
 /// Returns the rect it used.
+///
+/// The sensor rail draws its inline bars with [`bar_at`] instead, because a
+/// row's sub-bar must not swallow the row's width the way a gauge would —
+/// so this is currently the reference gauge, kept for the duty column.
+#[allow(dead_code)]
 pub fn gauge(ui: &mut egui::Ui, value_pct: f32, target_pct: Option<f32>, fill: Color32, height: f32) -> Rect {
     let tk = t();
     let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), height), egui::Sense::hover());
@@ -1307,7 +1325,7 @@ mod tests {
     fn raw_chips_and_hovered_border_track_the_pointer() {
         let mut h = Headless::new();
         // frame 1: two same-label raw chips (temperature sources do this)
-        let (rects, ids) = {
+        let (rects, _ids) = {
             let mut rects = Vec::new();
             let mut ids = Vec::new();
             h.frame(vec![], |ui| {

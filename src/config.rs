@@ -402,6 +402,7 @@ mod tests {
     #[test]
     fn repo_config_keeps_labels_and_loads_as_legacy() {
         #[derive(Deserialize)]
+        #[allow(dead_code)]
         struct LegacyChannel {
             enabled: bool,
             name: String,

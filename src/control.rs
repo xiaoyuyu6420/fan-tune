@@ -450,7 +450,7 @@ mod tests {
     /// tick — the daemon used to latch the flag and then only log.
     #[test]
     fn safe_duty_engages_and_persists_without_an_overlay() {
-        let nct = chip(1);
+        let _nct = chip(1);
         let mut p = ControlPass::new(1);
         let engaged: Mutex<bool> = Mutex::new(false);
         for _ in 0..SOURCE_FAIL_LIMIT {
@@ -601,7 +601,4 @@ mod tests {
         }
     }
 
-    fn writes(c: &FakeChip) -> Vec<(usize, f32)> {
-        c.writes.lock().unwrap().clone()
-    }
 }

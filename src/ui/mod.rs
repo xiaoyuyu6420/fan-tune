@@ -68,10 +68,6 @@ fn card_hover() -> egui::Color32 {
     theme::t().case_hi
 }
 #[inline]
-fn stroke() -> egui::Color32 {
-    theme::t().hair
-}
-#[inline]
 fn text() -> egui::Color32 {
     theme::t().fg
 }
@@ -81,12 +77,6 @@ fn text_dim() -> egui::Color32 {
 }
 #[inline]
 fn accent() -> egui::Color32 {
-    theme::t().accent
-}
-/// "Healthy" is deliberately quiet in this design language: no green. The one
-/// accent colour marks whatever currently wants attention.
-#[inline]
-fn ok() -> egui::Color32 {
     theme::t().accent
 }
 #[inline]
@@ -422,7 +412,7 @@ fn draw_history(ui: &mut egui::Ui, hist: &VecDeque<HistPoint>) {
     let tk = theme::t();
     ui.horizontal(|ui| {
         ui.label(theme::micro("历史", tk.muted));
-        let mut legend = |ui: &mut egui::Ui, color: egui::Color32, text: &str| {
+        let legend = |ui: &mut egui::Ui, color: egui::Color32, text: &str| {
             let (r, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
             ui.painter().rect_filled(r, egui::Rounding::ZERO, color);
             ui.label(theme::micro(text, tk.mark));
@@ -500,7 +490,7 @@ fn draw_history(ui: &mut egui::Ui, hist: &VecDeque<HistPoint>) {
                   y: &dyn Fn(f32) -> f32,
                   color: egui::Color32| {
         let mut seg: Vec<egui::Pos2> = Vec::new();
-        let mut flush = |seg: &mut Vec<egui::Pos2>| {
+        let flush = |seg: &mut Vec<egui::Pos2>| {
             if seg.len() >= 2 {
                 p.add(egui::Shape::line(seg.clone(), egui::Stroke::new(1.5_f32, color)));
             }
@@ -2528,7 +2518,6 @@ if !prof.calibrated {
         cfg: &mut AppConfig,
         all_sources: &[String],
         height: f32,
-        animating: bool,
     ) {
         // Drawn as a plotting board: an inset well, hairlines for the
         // grid, square control points, one accent curve.
@@ -4289,7 +4278,7 @@ egui::CollapsingHeader::new(theme::tracked_fitted(
                     // taken: one plot, read from across the room.
                     View::Curve => {
                         let h = (ui.available_height() * 0.8).max(280.0);
-                        self.curve_editor(ui, &mut cfg, &all_sources, h, animating);
+                        self.curve_editor(ui, &mut cfg, &all_sources, h);
                     }
                     View::Lights => {
                         self.rgb_panel(ui);

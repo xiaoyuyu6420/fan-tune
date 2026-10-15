@@ -38,6 +38,20 @@ fn deploy_runtime_assets() {
     }
 }
 fn main() {
+    // NOTE on the ".rsrc merge failure: multiple non-default manifests" linker
+    // warning this build produces: gcc unconditionally appends its own
+    // `default-manifest.o` (an asInvoker manifest) to the link line, so ld finds
+    // two RT_MANIFEST resources in .rsrc. It keeps OURS — verified by reading the
+    // RT_MANIFEST resource back out of the built exe and seeing requireAdministrator
+    // — so the warning is noise, not a broken build. No ld flag drops a named input
+    // object, and that object is appended after every `-l`, so it cannot be
+    // avoided from here either.
+    //
+    // `update_manifest.ps1` is therefore still required after every build: it
+    // re-embeds the manifest through the Win32 UpdateResource API, which also
+    // keeps the exe correct if a toolchain ever changes which manifest wins.
+    // Do not "fix" the warning by deleting the resource below.
+    //
     // On GNU toolchain we use windres + ar to embed the requireAdministrator
     // manifest (app.rc -> app.manifest) as a PE resource.
     //
