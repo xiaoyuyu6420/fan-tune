@@ -2740,6 +2740,13 @@ impl eframe::App for App {
 
         // frame-local working copies; published back at the end of the frame
         let mut cfg: AppConfig = self.cfg.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        // set by the discrete "make it take effect now" controls (启用 / 模式 /
+        // 温度源): the control loop only ever reads the file, so these save at
+        // the end of the frame instead of waiting for the 保存配置 button —
+        // same contract the profile / theme chips already have. Curve points
+        // and numeric knobs deliberately keep the explicit save (committing a
+        // half-dragged curve would push it to the fans mid-drag).
+        let mut dirty = false;
         // profile switch requested from the tray menu — applied here so the
         // frame-local copy and the end-of-frame publish-back agree
         let req = self.profile_req.swap(255, Ordering::Relaxed);
@@ -3841,7 +3848,7 @@ impl eframe::App for App {
                                         if !c.enabled {
                                             theme::chip_raw(ui, "未启用·不写入", false, theme::t().warn)
                                                 .on_hover_text(
-                                                    "enabled = false:程序完全不碰这个通道(曲线、手动、一键全速/静音、安全兜底都不写),风扇只由 BIOS 控制。要交给我们管,把它改成 true(改完点保存)。",
+                                                    "enabled = false:程序完全不碰这个通道(曲线、手动、一键全速/静音、安全兜底都不写),风扇只由 BIOS 控制。要交给我们管,在下方 ALGO SETTINGS 里勾上\"交给本程序\"(勾完立即生效)。",
                                                 );
                                         }
                                     }
@@ -3861,6 +3868,7 @@ impl eframe::App for App {
                                                 let on_this = c.mode == want;
                                                 if theme::chip(ui, label, on_this).clicked() {
                                                     c.mode = want;
+                                                    dirty = true;
                                                 }
                                             };
                                             pick(ui, FanMode::Curve, "曲线");
@@ -4123,14 +4131,22 @@ egui::CollapsingHeader::new(theme::tracked_fitted(
                                         theme::t().line_dim,
                                     ));
                                     ui.horizontal(|ui| {
-                                        ui.checkbox(&mut c.enabled, theme::micro("交给本程序", theme::t().fg_soft))
+                                        if ui.checkbox(&mut c.enabled, theme::micro("交给本程序", theme::t().fg_soft))
                                             .on_hover_text(
-                                                "勾上 = 按下面的模式/曲线控制它。取消勾选 = 程序完全不写这个通道(泵、或不想动的东西),交给 BIOS。",
-                                            );
-                                        ui.checkbox(&mut c.protected, theme::micro("保护", theme::t().fg_soft))
+                                                "勾上 = 按下面的模式/曲线控制它，保存后立即生效。取消勾选 = 程序完全不写这个通道(泵、或不想动的东西),交给 BIOS。",
+                                            )
+                                            .changed()
+                                        {
+                                            dirty = true;
+                                        }
+                                        if ui.checkbox(&mut c.protected, theme::micro("保护", theme::t().fg_soft))
                                             .on_hover_text(
                                                 "勾上 = 一键全速/静音、以及温度源失效兜底都不会碰它,只有它自己的模式/曲线会写它。给水泵这类不能随便降速的部件用。",
-                                            );
+                                            )
+                                            .changed()
+                                        {
+                                            dirty = true;
+                                        }
                                     });
                                     ui.label(theme::micro(
                                         "温度源(多选;未选则沿用单一来源)",
@@ -4146,6 +4162,7 @@ egui::CollapsingHeader::new(theme::tracked_fitted(
                                                 } else {
                                                     c.sources.push(key.clone());
                                                 }
+                                                dirty = true;
                                             }
                                         }
                                     });
@@ -4161,6 +4178,7 @@ egui::CollapsingHeader::new(theme::tracked_fitted(
                                         let mut pick = |ui: &mut egui::Ui, want: SourceCombine, label: &str| {
                                             if theme::chip(ui, label, c.combine == want).clicked() {
                                                 c.combine = want;
+                                                dirty = true;
                                             }
                                         };
                                         pick(ui, SourceCombine::Max, "取最大");
@@ -4318,6 +4336,12 @@ egui::CollapsingHeader::new(theme::tracked_fitted(
                     apply_all_channels(&self.nct, &cfg, &reading.temps, &nvme, gpu.map(|(t, _)| t))
                 }
             }
+        }
+        // the frame touched a control that must take effect now: commit it so
+        // the control loop's mtime reload picks it up on its next pass
+        if dirty {
+            let msg = save_toast(&cfg, "配置已保存（控制立即生效）".into());
+            self.toast = Some((msg, Instant::now()));
         }
         *self.cfg.lock().unwrap_or_else(|e| e.into_inner()) = cfg;
 
